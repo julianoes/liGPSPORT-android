@@ -6,6 +6,28 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- **Pair up to 3 BSC200 cycling computers simultaneously.** Uploading
+  a route fans out to every paired device in parallel — each one
+  opens its own GATT socket, the results come back as a per-device
+  map, and the destination card surfaces "all OK" vs "2/3 OK — last5
+  failed: …" rather than committing to a single outcome.
+- **Bottom-left status stack** with one pill per paired device.
+  Each pill polls its device's nav status independently every 15 s
+  and shows `<device> · Navigating: <route>` / `Idle` / `Connecting…`
+  — implicitly doubling as a "which devices are reachable" signal.
+- **Per-device sub-menus in Settings.** "Paired devices (n / 3)" is
+  the top section now; each device row has its own "Routes on
+  device" and "Activities on device" launchers plus a forget button.
+  The sub-screen Top App Bar reads the device name as a subtitle so
+  you always know which device's files you're editing.
+- **Pairing flow supports adding instead of replacing.** The
+  pairing screen lists currently-paired devices at the top with X
+  buttons; scan results below append rather than overwrite, capped
+  at the new `DeviceStore.MAX_DEVICES = 3`. Existing single-device
+  installs migrate the legacy SharedPreferences keys into slot 0.
+
 ### Changed
 
 - **Map screen now uses a Google-Maps-style multi-stop sheet** in

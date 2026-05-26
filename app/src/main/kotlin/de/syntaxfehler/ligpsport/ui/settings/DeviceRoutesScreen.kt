@@ -56,10 +56,18 @@ import kotlinx.coroutines.withContext
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DeviceRoutesScreen(onBack: () -> Unit) {
+fun DeviceRoutesScreen(onBack: () -> Unit, targetMac: String? = null) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val paired = remember { DeviceStore(ctx).address() != null }
+    val resolvedMac = remember(targetMac) {
+        targetMac ?: DeviceStore(ctx).address()
+    }
+    val deviceLabel = remember(resolvedMac) {
+        val list = DeviceStore(ctx).list()
+        list.firstOrNull { it.mac.equals(resolvedMac, ignoreCase = true) }
+            ?.let { it.name ?: it.mac }
+    }
+    val paired = resolvedMac != null
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var routes by remember { mutableStateOf<List<FileTransfer.RouteEntry>>(emptyList()) }
@@ -72,7 +80,9 @@ fun DeviceRoutesScreen(onBack: () -> Unit) {
         if (!paired) return
         loading = true; error = null
         scope.launch {
-            val res = withContext(Dispatchers.IO) { UploadPipeline.listRoutes(ctx) }
+            val res = withContext(Dispatchers.IO) {
+                UploadPipeline.listRoutes(ctx, targetMac = resolvedMac)
+            }
             when (res) {
                 is UploadPipeline.Result.Success -> routes = res.routes
                 is UploadPipeline.Result.Failure -> error = res.reason
@@ -86,7 +96,18 @@ fun DeviceRoutesScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Routes on device") },
+                title = {
+                    Column {
+                        Text("Routes on device")
+                        deviceLabel?.let {
+                            Text(
+                                it,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -206,7 +227,7 @@ fun DeviceRoutesScreen(onBack: () -> Unit) {
                         deletingAll = true
                         scope.launch {
                             val res = withContext(Dispatchers.IO) {
-                                UploadPipeline.deleteAllRoutes(ctx)
+                                UploadPipeline.deleteAllRoutes(ctx, targetMac = resolvedMac)
                             }
                             deletingAll = false
                             confirmDeleteAll = false
@@ -266,6 +287,7 @@ fun DeviceRoutesScreen(onBack: () -> Unit) {
                                         3 -> "fit"
                                         else -> "cnx"
                                     },
+                                    targetMac = resolvedMac,
                                 )
                             }
                             pendingDeleting = false

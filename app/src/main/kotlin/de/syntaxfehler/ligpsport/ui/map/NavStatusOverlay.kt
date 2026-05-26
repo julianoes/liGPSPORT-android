@@ -1,5 +1,6 @@
 package de.syntaxfehler.ligpsport.ui.map
 
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -27,6 +28,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.runtime.DisposableEffect
 import de.syntaxfehler.ligpsport.ble.DeviceStore
 import de.syntaxfehler.ligpsport.ble.UploadPipeline
 import kotlinx.coroutines.Dispatchers
@@ -34,52 +38,93 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 /**
- * Bottom-left navigation-status pill on [MapScreen]. Polls
- * `UploadPipeline.navStatus` every 15 s and renders one of four states:
+ * Bottom-left navigation-status stack on [MapScreen]. Renders one
+ * [NavStatusPill] per paired device (up to [DeviceStore.MAX_DEVICES]),
+ * each polling its own device's `ROUTE_PLAN LIST_GET` every 15 s. The
+ * pill text doubles as a "which devices are connected" indicator —
+ * Connecting / Idle / Navigating implies the most recent poll
+ * succeeded.
  *
- * - **Pair device first** — no `DeviceStore` address set.
- * - **Connecting…** — paired but the first poll hasn't completed.
- * - **Navigating: <route name>** — BSC200 has an `enum_USED_STATUS`
- *   entry in its `ROUTE_PLAN LIST_GET` reply (PROTOCOL.md §7.3).
- * - **No active route** — paired, polled, but no route is tagged USED.
+ * - **Pair device first** — no devices in [DeviceStore].
+ * - **<device> · Connecting…** — paired but the first poll hasn't
+ *   completed or the most recent poll failed.
+ * - **<device> · Navigating: <route name>** — BSC200 reports an
+ *   `enum_USED_STATUS` entry in `ROUTE_PLAN LIST_GET`
+ *   (PROTOCOL.md §7.3).
+ * - **<device> · Idle** — paired, polled, but no route is tagged USED.
  *
- * Async by design: the pill never blocks the map and shows the previous
- * value while a new poll is in flight. Errors fall back to "connecting"
- * — transient BLE failures shouldn't make the UI think pairing was
- * lost.
+ * Async by design: each pill never blocks the map and shows the
+ * previous value while a new poll is in flight. Transient BLE
+ * failures fall back to "connecting" rather than flipping to
+ * "unpaired" — pairing state doesn't actually change.
  */
 @Composable
 internal fun NavStatusOverlay(modifier: Modifier = Modifier) {
     val ctx = LocalContext.current
     val store = remember { DeviceStore(ctx) }
-    var state: NavStatusUiState by remember {
-        mutableStateOf(
-            if (store.address() == null) NavStatusUiState.Unpaired
-            else NavStatusUiState.Connecting,
-        )
+    var devices by remember { mutableStateOf(store.list()) }
+
+    // Re-read the paired set on resume so adding / removing a device
+    // in Settings shows up the next time the map foregrounds. Polling
+    // on every recomposition would be wasteful for a list that only
+    // changes when the user explicitly edits it.
+    @Suppress("DEPRECATION")
+    val lifecycle = androidx.compose.ui.platform.LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(lifecycle) {
+        val obs = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                devices = store.list()
+            }
+        }
+        lifecycle.addObserver(obs)
+        onDispose { lifecycle.removeObserver(obs) }
     }
 
-    LaunchedEffect(Unit) {
-        while (true) {
-            if (store.address() == null) {
-                state = NavStatusUiState.Unpaired
-                delay(2_000)
-                continue
+    Column(
+        modifier = modifier.testTag("nav_status_stack"),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        if (devices.isEmpty()) {
+            NavStatusPill(
+                state = NavStatusUiState.Unpaired,
+                deviceLabel = null,
+                modifier = Modifier.testTag("nav_status"),
+            )
+        } else {
+            for (device in devices) {
+                DeviceNavStatusPill(device = device)
             }
-            val res = withContext(Dispatchers.IO) { UploadPipeline.navStatus(ctx) }
+        }
+    }
+}
+
+@Composable
+private fun DeviceNavStatusPill(device: DeviceStore.Paired) {
+    val ctx = LocalContext.current
+    var state: NavStatusUiState by remember(device.mac) {
+        mutableStateOf(NavStatusUiState.Connecting)
+    }
+
+    LaunchedEffect(device.mac) {
+        while (true) {
+            val res = withContext(Dispatchers.IO) {
+                UploadPipeline.navStatus(ctx, targetMac = device.mac)
+            }
             state = when (res) {
                 is UploadPipeline.Result.Success -> {
                     val ns = res.navStatus
                     when {
                         ns == null -> NavStatusUiState.Connecting
-                        ns.isNavigating -> NavStatusUiState.Navigating(ns.activeRouteName.ifEmpty {
-                            ns.activeRouteId?.toString() ?: "?"
-                        })
+                        ns.isNavigating -> NavStatusUiState.Navigating(
+                            ns.activeRouteName.ifEmpty { ns.activeRouteId?.toString() ?: "?" },
+                        )
                         else -> NavStatusUiState.Idle
                     }
                 }
-                // Keep showing the previous (or "Connecting") on transient
-                // BLE failures rather than flipping back to "Unpaired".
+                // Keep showing the previous (or "Connecting") on
+                // transient BLE failures rather than flipping back to
+                // a more pessimistic state — the device is still
+                // paired, the radio just glitched.
                 is UploadPipeline.Result.Failure -> when (state) {
                     is NavStatusUiState.Navigating, NavStatusUiState.Idle -> state
                     else -> NavStatusUiState.Connecting
@@ -89,7 +134,11 @@ internal fun NavStatusOverlay(modifier: Modifier = Modifier) {
         }
     }
 
-    NavStatusPill(state, modifier)
+    NavStatusPill(
+        state = state,
+        deviceLabel = device.name ?: device.mac,
+        modifier = Modifier.testTag("nav_status_${device.mac}"),
+    )
 }
 
 internal sealed interface NavStatusUiState {
@@ -100,13 +149,18 @@ internal sealed interface NavStatusUiState {
 }
 
 @Composable
-internal fun NavStatusPill(state: NavStatusUiState, modifier: Modifier = Modifier) {
-    val label = when (state) {
+internal fun NavStatusPill(
+    state: NavStatusUiState,
+    deviceLabel: String?,
+    modifier: Modifier = Modifier,
+) {
+    val statusText = when (state) {
         NavStatusUiState.Unpaired -> "Pair device first"
         NavStatusUiState.Connecting -> "Connecting…"
         NavStatusUiState.Idle -> "No active route"
         is NavStatusUiState.Navigating -> "Navigating: ${state.routeName}"
     }
+    val label = if (deviceLabel != null) "$deviceLabel · $statusText" else statusText
     val leadingSpinner = state is NavStatusUiState.Connecting
     val icon: androidx.compose.ui.graphics.vector.ImageVector? = when (state) {
         NavStatusUiState.Unpaired -> Icons.Filled.BluetoothDisabled
@@ -115,7 +169,7 @@ internal fun NavStatusPill(state: NavStatusUiState, modifier: Modifier = Modifie
         is NavStatusUiState.Navigating -> Icons.Filled.Navigation
     }
     Surface(
-        modifier = modifier.testTag("nav_status"),
+        modifier = modifier,
         color = MaterialTheme.colorScheme.surfaceVariant,
         shape = RoundedCornerShape(20.dp),
         tonalElevation = 2.dp,

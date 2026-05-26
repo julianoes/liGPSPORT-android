@@ -8,9 +8,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
 import de.syntaxfehler.ligpsport.ui.map.MapScreen
 import de.syntaxfehler.ligpsport.ui.pairing.PairingScreen
 import de.syntaxfehler.ligpsport.ui.settings.DeviceActivitiesScreen
@@ -50,15 +52,27 @@ private fun AppNav() {
             SettingsScreen(
                 onBack = { nav.popBackStack() },
                 onOpenPairing = { nav.navigate("pairing") },
-                onOpenRoutes = { nav.navigate("settings/routes") },
-                onOpenActivities = { nav.navigate("settings/activities") },
+                onOpenRoutes = { mac -> nav.navigate("settings/routes/$mac") },
+                onOpenActivities = { mac -> nav.navigate("settings/activities/$mac") },
             )
         }
-        composable("settings/routes") {
-            DeviceRoutesScreen(onBack = { nav.popBackStack() })
+        composable(
+            route = "settings/routes/{mac}",
+            arguments = listOf(navArgument("mac") { type = NavType.StringType }),
+        ) { entry ->
+            DeviceRoutesScreen(
+                onBack = { nav.popBackStack() },
+                targetMac = entry.arguments?.getString("mac"),
+            )
         }
-        composable("settings/activities") {
-            DeviceActivitiesScreen(onBack = { nav.popBackStack() })
+        composable(
+            route = "settings/activities/{mac}",
+            arguments = listOf(navArgument("mac") { type = NavType.StringType }),
+        ) { entry ->
+            DeviceActivitiesScreen(
+                onBack = { nav.popBackStack() },
+                targetMac = entry.arguments?.getString("mac"),
+            )
         }
         composable("pairing") {
             PairingScreen(

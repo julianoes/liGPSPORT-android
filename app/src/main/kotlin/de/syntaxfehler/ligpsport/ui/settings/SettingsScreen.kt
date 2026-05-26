@@ -67,16 +67,15 @@ import de.syntaxfehler.ligpsport.route.RouterRegistry
 fun SettingsScreen(
     onBack: () -> Unit,
     onOpenPairing: () -> Unit,
-    onOpenRoutes: () -> Unit = {},
-    onOpenActivities: () -> Unit = {},
+    onOpenRoutes: (mac: String) -> Unit = {},
+    onOpenActivities: (mac: String) -> Unit = {},
 ) {
     val ctx = LocalContext.current
     val routerPrefs = remember { RouterPreferences(ctx) }
     var selected by remember { mutableStateOf(routerPrefs.get()) }
 
     val deviceStore = remember { DeviceStore(ctx) }
-    var pairedName by remember { mutableStateOf(deviceStore.name()) }
-    var pairedMac by remember { mutableStateOf(deviceStore.address()) }
+    var paired by remember { mutableStateOf(deviceStore.list()) }
     // Re-read on each resume so changes from PairingScreen show up
     // immediately after popping back to this screen.
     // `LocalLifecycleOwner` moved to lifecycle-runtime-compose; the
@@ -87,8 +86,7 @@ fun SettingsScreen(
     DisposableEffect(lifecycle) {
         val obs = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                pairedName = deviceStore.name()
-                pairedMac = deviceStore.address()
+                paired = deviceStore.list()
             }
         }
         lifecycle.addObserver(obs)
@@ -112,21 +110,32 @@ fun SettingsScreen(
             contentPadding = PaddingValues(vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            // --- Paired device --------------------------------------
+            // --- Paired devices -------------------------------------
             item {
-                SectionLabel("Paired device")
+                SectionLabel("Paired devices (${paired.size} / ${DeviceStore.MAX_DEVICES})")
             }
-            item {
-                PairedDeviceCard(
-                    name = pairedName,
-                    mac = pairedMac,
-                    onPair = onOpenPairing,
-                    onForget = {
-                        deviceStore.clear()
-                        pairedName = null
-                        pairedMac = null
-                    },
-                )
+            if (paired.isEmpty()) {
+                item {
+                    EmptyPairingCard(onPair = onOpenPairing)
+                }
+            } else {
+                items(items = paired, key = { it.mac }) { device ->
+                    PairedDeviceCard(
+                        device = device,
+                        onOpenRoutes = { onOpenRoutes(device.mac) },
+                        onOpenActivities = { onOpenActivities(device.mac) },
+                        onForget = {
+                            deviceStore.remove(device.mac)
+                            paired = deviceStore.list()
+                        },
+                    )
+                }
+                item {
+                    AddDeviceButton(
+                        enabled = paired.size < DeviceStore.MAX_DEVICES,
+                        onClick = onOpenPairing,
+                    )
+                }
             }
 
             // --- Routing method -------------------------------------
@@ -142,75 +151,11 @@ fun SettingsScreen(
                 )
             }
 
-            // --- Device files (sub-screens) -------------------------
-            item { SectionLabel("Device files") }
-            item {
-                SubScreenRow(
-                    title = "Routes on device",
-                    subtitle = "List, delete or wipe uploaded routes.",
-                    enabled = pairedMac != null,
-                    onClick = onOpenRoutes,
-                    testTag = "open_device_routes",
-                )
-            }
-            item {
-                SubScreenRow(
-                    title = "Activities on device",
-                    subtitle = "Download (FIT) or delete recorded rides.",
-                    enabled = pairedMac != null,
-                    onClick = onOpenActivities,
-                    testTag = "open_device_activities",
-                )
-            }
-
             // --- Map markers ----------------------------------------
             item { MarkerHitboxSection() }
 
             // --- AGPS token (kept at the bottom — advanced) ---------
             item { AgpsTokenSection() }
-        }
-    }
-}
-
-@Composable
-private fun SubScreenRow(
-    title: String,
-    subtitle: String,
-    enabled: Boolean,
-    onClick: () -> Unit,
-    testTag: String,
-) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp)
-            .clickable(enabled = enabled, onClick = onClick)
-            .testTag(testTag),
-    ) {
-        Row(
-            Modifier.padding(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    title,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = if (enabled) MaterialTheme.colorScheme.onSurface
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    if (enabled) subtitle else "$subtitle (pair a device first)",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            Icon(
-                Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
         }
     }
 }
@@ -436,16 +381,16 @@ private fun SectionLabel(text: String) {
 
 @Composable
 private fun PairedDeviceCard(
-    name: String?,
-    mac: String?,
-    onPair: () -> Unit,
+    device: DeviceStore.Paired,
+    onOpenRoutes: () -> Unit,
+    onOpenActivities: () -> Unit,
     onForget: () -> Unit,
 ) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp)
-            .testTag("paired_device_card"),
+            .testTag("paired_device_card_${device.mac}"),
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(
@@ -453,49 +398,136 @@ private fun PairedDeviceCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(
-                    if (mac == null) Icons.Default.BluetoothDisabled else Icons.Default.Bluetooth,
+                    Icons.Default.Bluetooth,
                     contentDescription = null,
-                    tint = if (mac == null) MaterialTheme.colorScheme.onSurfaceVariant
-                    else MaterialTheme.colorScheme.primary,
+                    tint = MaterialTheme.colorScheme.primary,
                 )
-                Column(Modifier.fillMaxWidth()) {
+                Column(Modifier.weight(1f)) {
                     Text(
-                        name ?: if (mac != null) "(unnamed)" else "Not paired",
+                        device.name ?: "(unnamed)",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    if (mac != null) {
-                        Text(
-                            mac,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    } else {
-                        Text(
-                            "Scan for an iGPSPORT cycling computer.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
+                    Text(
+                        device.mac,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilledTonalButton(
-                    onClick = onPair,
-                    modifier = Modifier.testTag("pair_button"),
+                IconButton(
+                    onClick = onForget,
+                    modifier = Modifier.testTag("forget_${device.mac}"),
                 ) {
-                    Text(if (mac == null) "Pair a device" else "Re-pair")
-                }
-                if (mac != null) {
-                    OutlinedButton(
-                        onClick = onForget,
-                        modifier = Modifier.testTag("forget_button"),
-                    ) {
-                        Text("Forget")
-                    }
+                    Icon(Icons.Default.BluetoothDisabled, contentDescription = "Forget device")
                 }
             }
+            DeviceSubScreenRow(
+                title = "Routes on device",
+                subtitle = "List, delete or wipe uploaded routes.",
+                onClick = onOpenRoutes,
+                testTag = "open_device_routes_${device.mac}",
+            )
+            DeviceSubScreenRow(
+                title = "Activities on device",
+                subtitle = "Download (FIT) or delete recorded rides.",
+                onClick = onOpenActivities,
+                testTag = "open_device_activities_${device.mac}",
+            )
         }
+    }
+}
+
+@Composable
+private fun DeviceSubScreenRow(
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+    testTag: String,
+) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .testTag(testTag),
+    ) {
+        Row(
+            Modifier.padding(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun EmptyPairingCard(onPair: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .testTag("paired_device_card_empty"),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Default.BluetoothDisabled,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "No devices paired",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        "Scan for up to ${DeviceStore.MAX_DEVICES} iGPSPORT cycling computers.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            FilledTonalButton(
+                onClick = onPair,
+                modifier = Modifier.testTag("pair_button"),
+            ) { Text("Pair a device") }
+        }
+    }
+}
+
+@Composable
+private fun AddDeviceButton(enabled: Boolean, onClick: () -> Unit) {
+    FilledTonalButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .testTag("pair_button"),
+    ) {
+        Text(if (enabled) "Add another device" else "Device limit reached")
     }
 }
 

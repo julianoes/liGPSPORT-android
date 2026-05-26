@@ -64,10 +64,18 @@ import java.util.Locale
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DeviceActivitiesScreen(onBack: () -> Unit) {
+fun DeviceActivitiesScreen(onBack: () -> Unit, targetMac: String? = null) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val paired = remember { DeviceStore(ctx).address() != null }
+    val resolvedMac = remember(targetMac) {
+        targetMac ?: DeviceStore(ctx).address()
+    }
+    val deviceLabel = remember(resolvedMac) {
+        val list = DeviceStore(ctx).list()
+        list.firstOrNull { it.mac.equals(resolvedMac, ignoreCase = true) }
+            ?.let { it.name ?: it.mac }
+    }
+    val paired = resolvedMac != null
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var entries by remember { mutableStateOf<List<FileTransfer.ActivityListEntry>>(emptyList()) }
@@ -82,7 +90,9 @@ fun DeviceActivitiesScreen(onBack: () -> Unit) {
         if (!paired) return
         loading = true; error = null
         scope.launch {
-            val res = withContext(Dispatchers.IO) { UploadPipeline.listActivities(ctx) }
+            val res = withContext(Dispatchers.IO) {
+                UploadPipeline.listActivities(ctx, targetMac = resolvedMac)
+            }
             when (res) {
                 is UploadPipeline.Result.Success -> entries = res.activities
                 is UploadPipeline.Result.Failure -> error = res.reason
@@ -96,7 +106,18 @@ fun DeviceActivitiesScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Activities on device") },
+                title = {
+                    Column {
+                        Text("Activities on device")
+                        deviceLabel?.let {
+                            Text(
+                                it,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -178,7 +199,11 @@ fun DeviceActivitiesScreen(onBack: () -> Unit) {
                             downloadingTs = e.timestamp
                             scope.launch {
                                 val res = withContext(Dispatchers.IO) {
-                                    UploadPipeline.downloadActivity(ctx, e.timestamp)
+                                    UploadPipeline.downloadActivity(
+                                        ctx,
+                                        e.timestamp,
+                                        targetMac = resolvedMac,
+                                    )
                                 }
                                 downloadingTs = null
                                 when (res) {
@@ -228,7 +253,7 @@ fun DeviceActivitiesScreen(onBack: () -> Unit) {
                         deletingAll = true
                         scope.launch {
                             val res = withContext(Dispatchers.IO) {
-                                UploadPipeline.deleteAllActivities(ctx)
+                                UploadPipeline.deleteAllActivities(ctx, targetMac = resolvedMac)
                             }
                             deletingAll = false
                             confirmDeleteAll = false
@@ -268,7 +293,11 @@ fun DeviceActivitiesScreen(onBack: () -> Unit) {
                         pendingDeleting = true
                         scope.launch {
                             val res = withContext(Dispatchers.IO) {
-                                UploadPipeline.deleteActivity(ctx, target.timestamp)
+                                UploadPipeline.deleteActivity(
+                                    ctx,
+                                    target.timestamp,
+                                    targetMac = resolvedMac,
+                                )
                             }
                             pendingDeleting = false
                             pendingDelete = null

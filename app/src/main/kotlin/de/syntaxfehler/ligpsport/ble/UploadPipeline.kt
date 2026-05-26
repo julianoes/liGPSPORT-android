@@ -22,6 +22,8 @@ import de.syntaxfehler.ligpsport.route.Point
 import de.syntaxfehler.ligpsport.route.RouteData
 import de.syntaxfehler.ligpsport.route.RouteProvider
 import de.syntaxfehler.ligpsport.route.RouterRegistry
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
@@ -118,6 +120,7 @@ object UploadPipeline {
         fileId: Long = System.currentTimeMillis() / 1000L,
         fileName: String = "route",
         providerOverride: RouteProvider? = null,
+        targetMac: String? = null,
     ): Result {
         val provider = providerOverride
             ?: RouterRegistry.byId(RouterPreferences(context).get())
@@ -133,7 +136,7 @@ object UploadPipeline {
             return Result.Failure("${provider.id} failed: ${e.message}")
         }
         Log.i(TAG, "plan: ${provider.id} returned ${gpx.size} bytes in ${System.currentTimeMillis() - t0}ms")
-        val upload = uploadGpx(context, gpx, fileId = fileId, fileName = fileName)
+        val upload = uploadGpx(context, gpx, fileId = fileId, fileName = fileName, targetMac = targetMac)
         return when (upload) {
             is Result.Success -> upload.copy(providerId = provider.id)
             is Result.Failure -> upload
@@ -148,8 +151,10 @@ object UploadPipeline {
         gpxBytes: ByteArray,
         fileId: Long = System.currentTimeMillis() / 1000L,
         fileName: String = "route",
+        targetMac: String? = null,
     ): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, pairedName, pairedMac) = transportSetup
 
         val route: RouteData = try {
@@ -248,10 +253,11 @@ object UploadPipeline {
      * `…action.SEND_LOCATION` adb broadcast for headless verification.
      */
     @SuppressLint("MissingPermission")
-    suspend fun sendCurrentLocation(context: Context): Result {
+    suspend fun sendCurrentLocation(context: Context, targetMac: String? = null): Result {
         val fix = resolveCurrentLocation(context)
             ?: return Result.Failure("no GPS fix — set a mock location or wait for a real fix")
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, name, mac) = transportSetup
         return try {
             transport.open()
@@ -313,8 +319,9 @@ object UploadPipeline {
      * instead so a failure here doesn't break the route flow.
      */
     @SuppressLint("MissingPermission")
-    suspend fun seedAgps(context: Context): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+    suspend fun seedAgps(context: Context, targetMac: String? = null): Result {
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, name, mac) = transportSetup
         return try {
             transport.open()
@@ -409,8 +416,10 @@ object UploadPipeline {
         context: Context,
         fileId: Long,
         fileExtension: String = "cnx",
+        targetMac: String? = null,
     ): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, _, _) = transportSetup
         return try {
             transport.open()
@@ -434,8 +443,9 @@ object UploadPipeline {
     // ---- Delete all (destructive) -----------------------------------
 
     @SuppressLint("MissingPermission")
-    suspend fun deleteAllRoutes(context: Context): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+    suspend fun deleteAllRoutes(context: Context, targetMac: String? = null): Result {
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, _, _) = transportSetup
         return try {
             transport.open()
@@ -452,8 +462,9 @@ object UploadPipeline {
     // ---- List ---------------------------------------------------------
 
     @SuppressLint("MissingPermission")
-    suspend fun listRoutes(context: Context): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+    suspend fun listRoutes(context: Context, targetMac: String? = null): Result {
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, name, mac) = transportSetup
         return try {
             transport.open()
@@ -469,8 +480,9 @@ object UploadPipeline {
     // ---- Nav-status (PROTOCOL.md §7.3) --------------------------------
 
     @SuppressLint("MissingPermission")
-    suspend fun navStatus(context: Context): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+    suspend fun navStatus(context: Context, targetMac: String? = null): Result {
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, name, mac) = transportSetup
         return try {
             transport.open()
@@ -491,8 +503,10 @@ object UploadPipeline {
         fileId: Long,
         name: String,
         fileExtension: String = "cnx",
+        targetMac: String? = null,
     ): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, _, _) = transportSetup
         return try {
             transport.open()
@@ -512,8 +526,9 @@ object UploadPipeline {
     // ---- Activities (CYCLING_DATA — recorded FIT files) --------------
 
     @SuppressLint("MissingPermission")
-    suspend fun listActivities(context: Context): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+    suspend fun listActivities(context: Context, targetMac: String? = null): Result {
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, name, mac) = transportSetup
         return try {
             transport.open()
@@ -541,8 +556,9 @@ object UploadPipeline {
      * it.
      */
     @SuppressLint("MissingPermission")
-    suspend fun downloadActivity(context: Context, timestamp: Long): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+    suspend fun downloadActivity(context: Context, timestamp: Long, targetMac: String? = null): Result {
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, name, mac) = transportSetup
         return try {
             transport.open()
@@ -564,8 +580,9 @@ object UploadPipeline {
     }
 
     @SuppressLint("MissingPermission")
-    suspend fun deleteActivity(context: Context, timestamp: Long): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+    suspend fun deleteActivity(context: Context, timestamp: Long, targetMac: String? = null): Result {
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, _, _) = transportSetup
         return try {
             transport.open()
@@ -580,8 +597,9 @@ object UploadPipeline {
     }
 
     @SuppressLint("MissingPermission")
-    suspend fun deleteAllActivities(context: Context): Result {
-        val transportSetup = openPairedTransport(context) ?: return Result.Failure("no paired device")
+    suspend fun deleteAllActivities(context: Context, targetMac: String? = null): Result {
+        val transportSetup = openPairedTransport(context, targetMac)
+            ?: return Result.Failure("no paired device")
         val (transport, _, _) = transportSetup
         return try {
             transport.open()
@@ -657,25 +675,93 @@ object UploadPipeline {
         }
     }
 
+    /**
+     * Resolve a fresh [BleTransport] for a specific device. When
+     * [targetMac] is null we pick the first paired device — that
+     * preserves the existing single-device semantics for every legacy
+     * caller (UploadScreen, the adb harness, etc.). When non-null we
+     * look the MAC up in [DeviceStore]; an unrecognised MAC returns
+     * null so the caller surfaces "device not paired" instead of
+     * silently routing to the wrong target.
+     */
     @SuppressLint("MissingPermission")
     private fun openPairedTransport(
         context: Context,
+        targetMac: String? = null,
     ): Triple<BleTransport, String?, String>? {
         val store = DeviceStore(context)
-        val address = store.address() ?: return null
-        val name = store.name()
+        val all = store.list()
+        if (all.isEmpty()) return null
+        val paired = if (targetMac == null) {
+            all.first()
+        } else {
+            all.firstOrNull { it.mac.equals(targetMac, ignoreCase = true) } ?: return null
+        }
         val adapter = bluetoothAdapter(context) ?: return null
         if (!adapter.isEnabled) return null
         val device = try {
-            adapter.getRemoteDevice(address)
+            adapter.getRemoteDevice(paired.mac)
         } catch (_: IllegalArgumentException) {
             return null
         }
-        return Triple(BleTransport(context, device), name, address)
+        return Triple(BleTransport(context, device), paired.name, paired.mac)
     }
 
     private fun bluetoothAdapter(context: Context): BluetoothAdapter? {
         val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         return manager?.adapter
+    }
+
+    // ---- Fan-out helpers --------------------------------------------
+    //
+    // Multi-device entry points. They iterate over every paired device
+    // in parallel (a separate BLE connection per device — the BSC200's
+    // GATT stack is fine handling 3 sockets concurrently) and return a
+    // MAC-keyed map of per-device results. Callers that want the
+    // legacy "do one device" behaviour still use the original singular
+    // functions above with their default targetMac=null.
+
+    /**
+     * Upload [gpxBytes] to every paired device in parallel.
+     * MAC-keyed result map; the keys are uppercase canonical MACs as
+     * stored in [DeviceStore]. Empty map → no devices paired.
+     */
+    @SuppressLint("MissingPermission")
+    suspend fun uploadGpxAll(
+        context: Context,
+        gpxBytes: ByteArray,
+        fileId: Long = System.currentTimeMillis() / 1000L,
+        fileName: String = "route",
+    ): Map<String, Result> {
+        val macs = DeviceStore(context).list().map { it.mac }
+        if (macs.isEmpty()) return emptyMap()
+        return coroutineScope {
+            macs.map { mac ->
+                mac to async {
+                    uploadGpx(
+                        context = context,
+                        gpxBytes = gpxBytes,
+                        fileId = fileId,
+                        fileName = fileName,
+                        targetMac = mac,
+                    )
+                }
+            }.associate { (mac, deferred) -> mac to deferred.await() }
+        }
+    }
+
+    /**
+     * Poll [navStatus] on every paired device in parallel. Used by the
+     * map screen's bottom-left status stack — one pill per device.
+     */
+    @SuppressLint("MissingPermission")
+    suspend fun navStatusAll(context: Context): Map<String, Result> {
+        val macs = DeviceStore(context).list().map { it.mac }
+        if (macs.isEmpty()) return emptyMap()
+        return coroutineScope {
+            macs.map { mac ->
+                mac to async { navStatus(context, targetMac = mac) }
+            }.associate { (mac, deferred) -> mac to deferred.await() }
+        }
     }
 }

@@ -55,23 +55,29 @@ fun UploadScreen(
 ) {
     val ctx = LocalContext.current
     val store = remember { DeviceStore(ctx) }
-    val pairedAddress = remember { store.address() }
-    val pairedName = remember { store.name() }
+    val paired = remember { store.list() }
+    val pairedSummary = remember(paired) {
+        when {
+            paired.isEmpty() -> null
+            paired.size == 1 -> paired.first().name ?: paired.first().mac
+            else -> "${paired.size} devices"
+        }
+    }
 
     var uploading by remember { mutableStateOf(false) }
-    var result by remember { mutableStateOf<UploadPipeline.Result?>(null) }
+    var result by remember { mutableStateOf<Map<String, UploadPipeline.Result>?>(null) }
     var status by remember {
         mutableStateOf(
             when {
                 gpx == null -> "No route to upload."
-                pairedAddress == null -> "No paired device — open Settings to pair one."
+                paired.isEmpty() -> "No paired device — open Settings to pair one."
                 else -> "Connecting & uploading…"
             },
         )
     }
 
-    LaunchedEffect(gpx, pairedAddress) {
-        if (gpx == null || pairedAddress == null) return@LaunchedEffect
+    LaunchedEffect(gpx, paired.size) {
+        if (gpx == null || paired.isEmpty()) return@LaunchedEffect
         if (result != null) return@LaunchedEffect // already done on this entry
         uploading = true
         // Use the picked destination name as the file name on the
@@ -81,15 +87,16 @@ fun UploadScreen(
         val displayName = RouteSessionStore.get()?.destinationName
         val fileName = sanitiseFileName(displayName) ?: "route"
         val res = withContext(Dispatchers.IO) {
-            UploadPipeline.uploadGpx(ctx, gpx, fileName = fileName)
+            UploadPipeline.uploadGpxAll(ctx, gpx, fileName = fileName)
         }
         uploading = false
         result = res
-        status = when (res) {
-            is UploadPipeline.Result.Success ->
-                "Upload complete (${res.bytesSent} B, device returned status ${res.status})."
-            is UploadPipeline.Result.Failure ->
-                "Upload failed: ${res.reason}"
+        val successes = res.count { it.value is UploadPipeline.Result.Success }
+        val failures = res.values.filterIsInstance<UploadPipeline.Result.Failure>()
+        status = when {
+            failures.isEmpty() -> "Upload complete to all $successes device${if (successes == 1) "" else "s"}."
+            successes == 0 -> "Upload failed: ${failures.first().reason}"
+            else -> "Upload partial: $successes/${res.size} OK; failed: ${failures.joinToString { it.reason }}"
         }
     }
 
@@ -99,9 +106,9 @@ fun UploadScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             // Headline: paired-device line.
-            if (pairedAddress != null) {
+            if (pairedSummary != null) {
                 Text(
-                    "Sending to ${pairedName ?: pairedAddress}",
+                    "Sending to $pairedSummary",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Medium,
                 )
@@ -114,6 +121,9 @@ fun UploadScreen(
             }
 
             // Status line / progress / outcome.
+            val r = result
+            val allOk = r != null && r.values.all { it is UploadPipeline.Result.Success }
+            val anyFail = r != null && r.values.any { it is UploadPipeline.Result.Failure }
             when {
                 uploading -> {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -121,15 +131,15 @@ fun UploadScreen(
                         Text(status, modifier = Modifier.testTag("upload_status"))
                     }
                 }
-                result is UploadPipeline.Result.Success -> {
+                allOk -> {
                     StatusRow(
                         icon = Icons.Default.CheckCircle,
                         tint = MaterialTheme.colorScheme.primary,
                         message = status,
-                        secondary = "Check the device's Saved Routes menu.",
+                        secondary = "Check each device's Saved Routes menu.",
                     )
                 }
-                result is UploadPipeline.Result.Failure -> {
+                anyFail -> {
                     StatusRow(
                         icon = Icons.Default.Error,
                         tint = MaterialTheme.colorScheme.error,
@@ -141,7 +151,7 @@ fun UploadScreen(
                 }
             }
 
-            if (pairedAddress == null) {
+            if (paired.isEmpty()) {
                 FilledTonalButton(
                     onClick = onOpenSettings,
                     modifier = Modifier.testTag("open_settings"),

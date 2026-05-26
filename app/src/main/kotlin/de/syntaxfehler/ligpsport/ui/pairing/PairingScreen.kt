@@ -22,6 +22,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
@@ -33,9 +34,9 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -54,20 +55,22 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 /**
- * BLE device picker: requests the runtime permissions iGPSPORT needs,
- * scans for advertising packets matching the known name prefixes
- * (BSC, iGS, iGPSPORT), and saves the user's choice as the "paired
- * device" for subsequent uploads.
+ * BLE device picker. Requests the runtime permissions iGPSPORT needs,
+ * scans for advertising packets matching the known name prefixes (BSC,
+ * iGS, iGPSPORT), and *appends* the user's choice to the list of paired
+ * devices — up to [DeviceStore.MAX_DEVICES]. Already-paired entries
+ * surface at the top with X buttons so the user can drop a device
+ * without leaving the screen.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PairingScreen(onPaired: () -> Unit, onBack: () -> Unit) {
     val ctx = LocalContext.current
     val store = remember { DeviceStore(ctx) }
-    val devices = remember { mutableStateMapOf<String, ScanEntry>() }
+    val paired = remember { mutableStateListOf<DeviceStore.Paired>().apply { addAll(store.list()) } }
+    val scanned = remember { mutableStateMapOf<String, ScanEntry>() }
     var scanning by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
-    var selectedAddress by remember { mutableStateOf(store.address()) }
 
     val requiredPermissions: Array<String> = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -106,14 +109,14 @@ fun PairingScreen(onPaired: () -> Unit, onBack: () -> Unit) {
             statusMessage = "Grant Bluetooth permissions first."
         } else {
             scanning = true
-            devices.clear()
+            scanned.clear()
             scope.launch {
                 try {
                     @Suppress("MissingPermission")
                     scanner.scan().collectLatest { dev ->
                         @Suppress("MissingPermission")
                         val name = try { dev.name } catch (_: SecurityException) { null }
-                        devices[dev.address] = ScanEntry(dev, name)
+                        scanned[dev.address] = ScanEntry(dev, name)
                     }
                 } catch (e: Exception) {
                     statusMessage = "Scan failed: ${e.message}"
@@ -124,6 +127,8 @@ fun PairingScreen(onPaired: () -> Unit, onBack: () -> Unit) {
         }
     }
     LaunchedEffect(permissionsGranted) { if (permissionsGranted) startScan() }
+
+    val capReached = paired.size >= DeviceStore.MAX_DEVICES
 
     Scaffold(
         topBar = {
@@ -137,51 +142,99 @@ fun PairingScreen(onPaired: () -> Unit, onBack: () -> Unit) {
             )
         },
     ) { padding ->
-        Column(Modifier.padding(padding).fillMaxSize()) {
-            if (scanning) {
-                Row(
-                    Modifier.fillMaxWidth().padding(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                    Text("Scanning for BSC / iGS / iGPSPORT devices…")
+        LazyColumn(
+            modifier = Modifier.padding(padding).fillMaxSize().testTag("paired_list"),
+            contentPadding = PaddingValues(vertical = 8.dp),
+        ) {
+            // Currently-paired devices --------------------------------
+            item {
+                SectionLabel(
+                    "Paired (${paired.size} / ${DeviceStore.MAX_DEVICES})",
+                )
+            }
+            if (paired.isEmpty()) {
+                item {
+                    Text(
+                        "No devices paired yet — pick one from the scan results below.",
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             } else {
-                Text(
-                    "Make sure your computer is awake and within range.",
-                    modifier = Modifier.padding(16.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
-            statusMessage?.let {
-                Text(
-                    it,
-                    modifier = Modifier.padding(horizontal = 16.dp),
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-            LazyColumn(
-                modifier = Modifier.fillMaxSize().testTag("paired_list"),
-                contentPadding = PaddingValues(vertical = 8.dp),
-            ) {
-                items(
-                    items = devices.values.sortedBy { it.name ?: it.device.address }.toList(),
-                    key = { it.device.address },
-                ) { entry ->
-                    DeviceRow(
-                        entry = entry,
-                        selected = entry.device.address == selectedAddress,
-                        onClick = {
-                            store.save(name = entry.name, address = entry.device.address)
-                            selectedAddress = entry.device.address
-                            // Pop back to wherever the user came from
-                            // immediately — no manual confirmation
-                            // needed once they've made a pick.
-                            onPaired()
+                items(items = paired.toList(), key = { it.mac }) { p ->
+                    PairedRow(
+                        paired = p,
+                        onRemove = {
+                            store.remove(p.mac)
+                            paired.removeAll { it.mac.equals(p.mac, ignoreCase = true) }
                         },
                     )
                 }
+            }
+
+            // Scan section ------------------------------------------
+            item {
+                SectionLabel(
+                    if (capReached) "Cap reached — remove one to add another"
+                    else "Nearby devices",
+                )
+            }
+            if (scanning) {
+                item {
+                    Row(
+                        Modifier.fillMaxWidth().padding(16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Text("Scanning for BSC / iGS / iGPSPORT devices…")
+                    }
+                }
+            } else {
+                item {
+                    Text(
+                        "Make sure your computer is awake and within range.",
+                        modifier = Modifier.padding(16.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+            statusMessage?.let {
+                item {
+                    Text(
+                        it,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+            items(
+                items = scanned.values.sortedBy { it.name ?: it.device.address }.toList(),
+                key = { it.device.address },
+            ) { entry ->
+                val alreadyPaired = paired.any { it.mac.equals(entry.device.address, ignoreCase = true) }
+                ScannedRow(
+                    entry = entry,
+                    alreadyPaired = alreadyPaired,
+                    enabled = !alreadyPaired && !capReached,
+                    onClick = {
+                        if (alreadyPaired || capReached) return@ScannedRow
+                        val added = store.add(name = entry.name, mac = entry.device.address)
+                        if (!added) {
+                            statusMessage =
+                                "Device limit (${DeviceStore.MAX_DEVICES}) reached — remove one first."
+                            return@ScannedRow
+                        }
+                        // Refresh in-memory snapshot from disk so the
+                        // canonical (uppercased) MAC is what we render.
+                        paired.clear()
+                        paired.addAll(store.list())
+                        // Pop back: the user picked a device, the
+                        // explicit confirmation isn't needed.
+                        onPaired()
+                    },
+                )
             }
         }
     }
@@ -190,12 +243,67 @@ fun PairingScreen(onPaired: () -> Unit, onBack: () -> Unit) {
 private data class ScanEntry(val device: BluetoothDevice, val name: String?)
 
 @Composable
-private fun DeviceRow(entry: ScanEntry, selected: Boolean, onClick: () -> Unit) {
+private fun SectionLabel(text: String) {
+    Text(
+        text,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun PairedRow(paired: DeviceStore.Paired, onRemove: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .testTag("paired_${paired.mac}"),
+    ) {
+        Row(
+            Modifier.padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Default.CheckCircle,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+            )
+            Column(Modifier.weight(1f)) {
+                Text(
+                    paired.name ?: "(unnamed)",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    paired.mac,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(
+                onClick = onRemove,
+                modifier = Modifier.testTag("remove_${paired.mac}"),
+            ) {
+                Icon(Icons.Default.Close, contentDescription = "Remove pairing")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScannedRow(
+    entry: ScanEntry,
+    alreadyPaired: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 6.dp)
-            .clickable(onClick = onClick)
+            .then(if (enabled) Modifier.clickable(onClick = onClick) else Modifier)
             .testTag("device_${entry.device.address}"),
     ) {
         Row(
@@ -204,9 +312,9 @@ private fun DeviceRow(entry: ScanEntry, selected: Boolean, onClick: () -> Unit) 
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                if (selected) Icons.Default.CheckCircle else Icons.Default.Bluetooth,
+                if (alreadyPaired) Icons.Default.CheckCircle else Icons.Default.Bluetooth,
                 contentDescription = null,
-                tint = if (selected) MaterialTheme.colorScheme.primary
+                tint = if (alreadyPaired) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Column(Modifier.fillMaxWidth()) {
@@ -214,9 +322,12 @@ private fun DeviceRow(entry: ScanEntry, selected: Boolean, onClick: () -> Unit) 
                     entry.name ?: "(unnamed)",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
+                    color = if (enabled || alreadyPaired) MaterialTheme.colorScheme.onSurface
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    entry.device.address,
+                    if (alreadyPaired) "${entry.device.address} • paired"
+                    else entry.device.address,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -224,4 +335,3 @@ private fun DeviceRow(entry: ScanEntry, selected: Boolean, onClick: () -> Unit) 
         }
     }
 }
-

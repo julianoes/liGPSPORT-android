@@ -657,8 +657,17 @@ fun MapScreen(
                     val uploadedStart = startOverride
                     uploadState = UploadButtonState.Uploading
                     scope.launch {
-                        val res = withContext(Dispatchers.IO) {
-                            UploadPipeline.uploadGpx(ctx, gpx, fileName = fileName)
+                        // Fan out to every paired device. The pipeline
+                        // opens a separate GATT connection per MAC,
+                        // serialises uploads inside each transport's
+                        // mutex, and returns a MAC-keyed map so we can
+                        // distinguish "all good" from "device 3 was
+                        // off". Single-device users see exactly the
+                        // same behaviour as before — the map has one
+                        // entry, which collapses cleanly into the
+                        // existing Success / Failed states.
+                        val results = withContext(Dispatchers.IO) {
+                            UploadPipeline.uploadGpxAll(ctx, gpx, fileName = fileName)
                         }
                         val current = destination
                         val routeChanged = current == null ||
@@ -668,11 +677,25 @@ fun MapScreen(
                             startOverride != uploadedStart
                         uploadState = if (routeChanged) {
                             UploadButtonState.Idle
-                        } else when (res) {
-                            is UploadPipeline.Result.Success ->
-                                UploadButtonState.Success
-                            is UploadPipeline.Result.Failure ->
-                                UploadButtonState.Failed(res.reason)
+                        } else if (results.isEmpty()) {
+                            UploadButtonState.Failed("no paired device")
+                        } else {
+                            val successes = results.count { it.value is UploadPipeline.Result.Success }
+                            val failures = results
+                                .filterValues { it is UploadPipeline.Result.Failure }
+                                .mapValues { (it.value as UploadPipeline.Result.Failure).reason }
+                            when {
+                                failures.isEmpty() -> UploadButtonState.Success
+                                successes == 0 -> UploadButtonState.Failed(
+                                    failures.values.first(),
+                                )
+                                else -> UploadButtonState.Failed(
+                                    "$successes/${results.size} OK — " +
+                                        failures.entries.joinToString("; ") { (mac, why) ->
+                                            "${mac.takeLast(5)}: $why"
+                                        },
+                                )
+                            }
                         }
                     }
                 },
