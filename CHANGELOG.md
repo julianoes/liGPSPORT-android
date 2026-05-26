@@ -6,6 +6,29 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- **Map screen now uses a Google-Maps-style multi-stop sheet** in
+  place of the single destination search bar. With no route in
+  progress the top shows one "Where to?" row; once a destination is
+  set it expands into Start → vias → Destination, each row tappable
+  to swap into inline Photon autocomplete. Start is now searchable
+  (previously drag-only) and shows the reverse-geocoded place name
+  instead of just "Your location" when the user picks a custom
+  origin or drags the start marker.
+- **Tapping the map after a destination is set** now opens a small
+  popup anchored to the tap pixel with two actions —
+  "Set as destination" / "Add stop" — instead of silently replacing
+  the destination and wiping every existing intermediate stop. The
+  first tap with no destination still picks one directly.
+  Long-press remains a quick shortcut for "add a stop" (matches
+  existing muscle memory) and now reverse-geocodes the added
+  waypoint so its top-bar row shows the nearest place name.
+- **Intermediate stops are now reorderable** via drag handles on
+  each via row in the top bar. Each row also has an X button for
+  removal — tapping the marker on the map no longer removes the
+  stop, since stray taps used to drop stops by accident.
+
 ## [1.2.0] — 2026-05-17
 
 Recorded-activities management on top of v1.1.0's route editing,

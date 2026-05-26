@@ -7,20 +7,15 @@ import android.view.MotionEvent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cancel
@@ -29,34 +24,27 @@ import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.MyLocation
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DockedSearchBar
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.SearchBarDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -71,13 +59,8 @@ import de.syntaxfehler.ligpsport.route.GpxParser
 import de.syntaxfehler.ligpsport.route.Point
 import de.syntaxfehler.ligpsport.route.RouterRegistry
 import de.syntaxfehler.ligpsport.search.PhotonClient
-import de.syntaxfehler.ligpsport.search.SearchResult
 import de.syntaxfehler.ligpsport.ui.upload.sanitiseFileName
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.FlowPreview
-import kotlinx.coroutines.flow.debounce
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.osmdroid.events.MapEventsReceiver
@@ -99,7 +82,6 @@ import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
  * - Tap-on-map is preserved as a quick fallback gesture for picking
  *   places the geocoder can't name.
  */
-@OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
 @Composable
 fun MapScreen(
     onOpenPairing: () -> Unit,
@@ -145,6 +127,22 @@ fun MapScreen(
         lifecycle.addObserver(obs)
         onDispose { lifecycle.removeObserver(obs) }
     }
+    // Live mirror of RouteSessionStore.plannedGpx so the Upload button
+    // can react to the most recent plan without re-reading the store on
+    // every recomposition. Pre-populated from any restored session.
+    var plannedGpx by remember { mutableStateOf(initialSession?.plannedGpx) }
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+    var currentLocation by remember { mutableStateOf<Point?>(null) }
+    // Set by a map tap once a destination is already in place: opens
+    // the [TapActionPopup] anchored to the tapped pixel coordinates.
+    // Null when no popup is showing. We stash the GeoPoint plus the
+    // pixel coords captured at tap time so the popup placement doesn't
+    // drift on subsequent map pans.
+    var pendingTap by remember { mutableStateOf<PendingTap?>(null) }
+    // Sticky display label for the Start row. Defaults to "Your
+    // location"; replaced when the user picks a custom origin via
+    // either dragging the start marker or searching the Start row.
+    var startLabel by remember { mutableStateOf("Your location") }
     // Drag-end handler for the destination marker. Updates coords but
     // keeps the existing label (a drag isn't a "pick a new place"
     // gesture) and keeps the intermediates list intact (the user is
@@ -154,21 +152,25 @@ fun MapScreen(
     }
     // Drag-end for the Start marker — promotes the live fix to an
     // explicit override so subsequent live-fix updates don't yank the
-    // route's origin out from under the user.
+    // route's origin out from under the user. The Start row's label
+    // is then reverse-geocoded asynchronously so the top bar shows
+    // the nearest place name; until that round-trip lands we display
+    // the raw coordinates so the row never reads "Your location"
+    // while in fact pointing somewhere else.
     val onStartDragEnd: (Double, Double) -> Unit = { lat, lon ->
         startOverride = Point(lat, lon)
+        startLabel = "%.5f, %.5f".format(lat, lon)
+        scope.launch {
+            val named = try {
+                withContext(Dispatchers.IO) { PhotonClient().reverse(lat, lon) }
+            } catch (_: Exception) {
+                null
+            } ?: return@launch
+            val cur = startOverride ?: return@launch
+            if (cur.latitude != lat || cur.longitude != lon) return@launch
+            startLabel = named.name
+        }
     }
-    // Live mirror of RouteSessionStore.plannedGpx so the Upload button
-    // can react to the most recent plan without re-reading the store on
-    // every recomposition. Pre-populated from any restored session.
-    var plannedGpx by remember { mutableStateOf(initialSession?.plannedGpx) }
-    var statusMessage by remember { mutableStateOf<String?>(null) }
-    var searchQuery by remember { mutableStateOf("") }
-    var searchActive by remember { mutableStateOf(false) }
-    val queryFlow = remember { MutableStateFlow("") }
-    var suggestions by remember { mutableStateOf<List<SearchResult>>(emptyList()) }
-    var searching by remember { mutableStateOf(false) }
-    var currentLocation by remember { mutableStateOf<Point?>(null) }
     var hasLocationPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION) ==
@@ -301,92 +303,86 @@ fun MapScreen(
         }
     }
 
-    // Debounced search trigger. Photon's free instance asks consumers
-    // to keep the QPS modest; 300 ms feels snappy yet polite.
-    LaunchedEffect(Unit) {
-        queryFlow
-            .debounce(300)
-            .distinctUntilChanged()
-            .collect { q ->
-                if (q.isBlank()) {
-                    suggestions = emptyList()
-                    searching = false
-                    return@collect
+    // Picks the tapped point as the destination. Renders a marker with
+    // a provisional "lat, lon" label, then upgrades the label
+    // asynchronously via Photon reverse-geocoding. The previous
+    // intermediates list is preserved — a Google-Maps-style flow lets
+    // the user keep their vias when refining the destination.
+    val pickDestinationFromGeo: (GeoPoint) -> Unit = pick@{ p ->
+        val provisional = Destination(
+            label = "%.5f, %.5f".format(p.latitude, p.longitude),
+            lat = p.latitude,
+            lon = p.longitude,
+        )
+        setDestination(mapView, destination, provisional, hitboxSizeDp, onDestDragEnd)
+        destination = provisional
+        scope.launch {
+            val named = try {
+                withContext(Dispatchers.IO) { PhotonClient().reverse(p.latitude, p.longitude) }
+            } catch (_: Exception) {
+                null
+            } ?: return@launch
+            val cur = destination ?: return@launch
+            if (cur.lat != p.latitude || cur.lon != p.longitude) return@launch
+            val upgraded = Destination(named.name, p.latitude, p.longitude)
+            setDestination(mapView, cur, upgraded, hitboxSizeDp, onDestDragEnd)
+            destination = upgraded
+        }
+    }
+    // Appends the tapped point as a new intermediate. Reverse-geocodes
+    // the position so the top bar's stop row shows the nearest place
+    // name instead of "Stop N". Only meaningful when a destination
+    // already exists; the caller is responsible for that guard.
+    val addIntermediateFromGeo: (GeoPoint) -> Unit = add@{ p ->
+        val newId = System.nanoTime()
+        intermediates = intermediates + Waypoint(
+            id = newId,
+            lat = p.latitude,
+            lon = p.longitude,
+            label = null,
+        )
+        scope.launch {
+            val named = try {
+                withContext(Dispatchers.IO) { PhotonClient().reverse(p.latitude, p.longitude) }
+            } catch (_: Exception) {
+                null
+            } ?: return@launch
+            intermediates = intermediates.map { existing ->
+                if (existing.id == newId && existing.lat == p.latitude && existing.lon == p.longitude) {
+                    existing.copy(label = named.name)
+                } else {
+                    existing
                 }
-                searching = true
-                // Prefer the live current location so suggestions are
-                // sorted by distance from the user; fall back to map
-                // centre when we don't have a fix yet.
-                val biasLat = currentLocation?.latitude ?: mapView.mapCenter.latitude
-                val biasLon = currentLocation?.longitude ?: mapView.mapCenter.longitude
-                val results = try {
-                    withContext(Dispatchers.IO) {
-                        PhotonClient().autocomplete(
-                            query = q,
-                            biasLat = biasLat,
-                            biasLon = biasLon,
-                            limit = 8,
-                        )
-                    }
-                } catch (e: Exception) {
-                    statusMessage = "Search failed: ${e.message}"
-                    emptyList()
-                }
-                suggestions = results
-                searching = false
             }
+        }
     }
 
     DisposableEffect(mapView) {
         val receiver = object : MapEventsReceiver {
             override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
-                if (p != null) {
-                    // Provisional label: coordinates while we wait for
-                    // reverse-geocoding. The picker doesn't have to
-                    // stall on a network round-trip; the label
-                    // upgrades in place once Photon responds.
-                    val provisional = Destination(
-                        label = "%.5f, %.5f".format(p.latitude, p.longitude),
-                        lat = p.latitude,
-                        lon = p.longitude,
-                    )
-                    intermediates = emptyList()
-                    setDestination(mapView, destination, provisional, hitboxSizeDp, onDestDragEnd)
-                    destination = provisional
-                    // Collapse the search overlay — the user just made
-                    // a pick gesture; keeping the search panel open
-                    // would hide the destination card behind it.
-                    searchActive = false
-                    scope.launch {
-                        val named = try {
-                            withContext(Dispatchers.IO) {
-                                PhotonClient().reverse(p.latitude, p.longitude)
-                            }
-                        } catch (_: Exception) {
-                            null
-                        } ?: return@launch
-                        // Only upgrade if the user hasn't moved on to a
-                        // different destination in the meantime.
-                        val cur = destination ?: return@launch
-                        if (cur.lat != p.latitude || cur.lon != p.longitude) return@launch
-                        val upgraded = Destination(named.name, p.latitude, p.longitude)
-                        setDestination(mapView, cur, upgraded, hitboxSizeDp, onDestDragEnd)
-                        destination = upgraded
-                    }
+                if (p == null) return false
+                if (destination == null) {
+                    // First-ever pick: treat as the destination.
+                    pickDestinationFromGeo(p)
+                } else {
+                    // Subsequent tap with a route in progress: surface
+                    // the Set-destination / Add-stop popup at the tap
+                    // pixel. Convert the GeoPoint to pixel coords now
+                    // so the popup placement doesn't drift if the user
+                    // pans the map before choosing.
+                    val pix = mapView.projection.toPixels(p, null)
+                    pendingTap = PendingTap(p, pix.x, pix.y)
                 }
                 return true
             }
             override fun longPressHelper(p: GeoPoint?): Boolean {
                 if (p == null) return false
-                // Long-press adds an intermediate stop (Google-Maps-style
-                // "add a via point"). Only meaningful once a destination
-                // exists — otherwise there's nothing to route through.
+                // Long-press remains a quick shortcut for "add an
+                // intermediate stop" — bypassing the popup matches
+                // Google Maps' muscle memory. Only meaningful once a
+                // destination exists.
                 if (destination == null) return false
-                intermediates = intermediates + Waypoint(
-                    id = System.nanoTime(),
-                    lat = p.latitude,
-                    lon = p.longitude,
-                )
+                addIntermediateFromGeo(p)
                 return true
             }
         }
@@ -409,77 +405,102 @@ fun MapScreen(
             modifier = Modifier.fillMaxSize().testTag("osm_map"),
         )
 
-        // Search bar overlays the map at the top.
-        DockedSearchBar(
+        // Google-Maps-style stops sheet, with the status toast stacked
+        // directly beneath it. They share a single TopCenter column so
+        // the toast always flows below whatever height the bar happens
+        // to take (one row in empty state, four-plus rows once vias are
+        // added) — previously the toast was anchored to a hard-coded
+        // top padding tuned for the old single-line search bar, which
+        // made it overlap the multi-row stops sheet.
+        Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp)
-                .testTag("search_bar"),
-            inputField = {
-                SearchBarDefaults.InputField(
-                    query = searchQuery,
-                    onQueryChange = {
-                        searchQuery = it
-                        queryFlow.value = it
-                    },
-                    onSearch = { searchActive = false },
-                    expanded = searchActive,
-                    onExpandedChange = { searchActive = it },
-                    placeholder = { Text("Search a destination…") },
-                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-                    trailingIcon = if (searchQuery.isNotEmpty()) {
-                        {
-                            IconButton(onClick = {
-                                searchQuery = ""
-                                queryFlow.value = ""
-                                suggestions = emptyList()
-                            }) {
-                                Icon(Icons.Default.Cancel, contentDescription = "Clear")
-                            }
-                        }
-                    } else null,
-                )
-            },
-            expanded = searchActive,
-            onExpandedChange = { searchActive = it },
-            colors = SearchBarDefaults.colors(),
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            // Suggestion list, "organic" — most-relevant-closest first.
-            if (searching) {
-                Row(
-                    Modifier.fillMaxWidth().padding(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                    Text("Searching…", style = MaterialTheme.typography.bodyMedium)
-                }
-            }
-            LazyColumn(modifier = Modifier.fillMaxWidth()) {
-                itemsIndexed(
-                    items = suggestions,
-                    // Index in the key guarantees uniqueness even when
-                    // Photon returns two features at the same (name, lat,
-                    // lon) — happens for stacked POIs and used to crash
-                    // LazyColumn with "Two keys are equal".
-                    key = { i, r -> "$i|${r.latitude}|${r.longitude}|${r.name}" },
-                ) { _, result ->
-                    SuggestionRow(
-                        result = result,
-                        onClick = {
-                            val picked = Destination(result.name, result.latitude, result.longitude)
-                            intermediates = emptyList()
-                            destination = setDestination(mapView, destination, picked, hitboxSizeDp, onDestDragEnd)
-                            mapView.controller.animateTo(GeoPoint(picked.lat, picked.lon))
-                            searchQuery = result.name
-                            queryFlow.value = ""
-                            suggestions = emptyList()
-                            searchActive = false
-                        },
+            RouteStopsBar(
+                destination = destination,
+                intermediates = intermediates,
+                startLabel = startLabel,
+                startIsOverride = startOverride != null,
+                currentLocation = currentLocation,
+                onDestinationPicked = { result ->
+                    val picked = Destination(result.name, result.latitude, result.longitude)
+                    destination = setDestination(mapView, destination, picked, hitboxSizeDp, onDestDragEnd)
+                    mapView.controller.animateTo(GeoPoint(picked.lat, picked.lon))
+                },
+                onStartChange = { result ->
+                    startOverride = Point(result.latitude, result.longitude)
+                    startLabel = result.name
+                    mapView.controller.animateTo(GeoPoint(result.latitude, result.longitude))
+                },
+                onStartClear = {
+                    startOverride = null
+                    startLabel = "Your location"
+                },
+                onViaChange = { id, result ->
+                    intermediates = intermediates.map {
+                        if (it.id == id) it.copy(
+                            lat = result.latitude,
+                            lon = result.longitude,
+                            label = result.name,
+                        ) else it
+                    }
+                },
+                onViaRemove = { id ->
+                    intermediates = intermediates.filterNot { it.id == id }
+                },
+                onViaReorder = { from, to ->
+                    val safeFrom = from.coerceIn(0, intermediates.lastIndex)
+                    val safeTo = to.coerceIn(0, intermediates.lastIndex)
+                    if (safeFrom == safeTo) return@RouteStopsBar
+                    intermediates = intermediates.toMutableList().also { list ->
+                        val item = list.removeAt(safeFrom)
+                        list.add(safeTo, item)
+                    }
+                },
+                onAddStop = { result ->
+                    intermediates = intermediates + Waypoint(
+                        id = System.nanoTime(),
+                        lat = result.latitude,
+                        lon = result.longitude,
+                        label = result.name,
                     )
+                },
+            )
+
+            statusMessage?.let { msg ->
+                Surface(
+                    modifier = Modifier
+                        .clickable { statusMessage = null }
+                        .testTag("status_toast"),
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    shape = RoundedCornerShape(20.dp),
+                ) {
+                    Text(msg, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
                 }
             }
+        }
+
+        // Tap-action popup, anchored to the left of the tapped pixel
+        // when a destination is already in place. Closed by either
+        // choosing an action or tapping outside the popup.
+        pendingTap?.let { tap ->
+            TapActionPopup(
+                pixelX = tap.pixelX,
+                pixelY = tap.pixelY,
+                onSetDestination = {
+                    pickDestinationFromGeo(tap.geo)
+                    pendingTap = null
+                },
+                onAddStop = {
+                    addIntermediateFromGeo(tap.geo)
+                    pendingTap = null
+                },
+                onDismiss = { pendingTap = null },
+            )
         }
 
         // Bottom-left navigation-status pill. Polls the BSC200's
@@ -577,12 +598,13 @@ fun MapScreen(
                 waypoints = intermediates,
                 hitboxSizeDp = hitboxSizeDp,
                 onMove = { id, lat, lon ->
+                    // Dragging invalidates the previous reverse-
+                    // geocoded label — the place name is for the old
+                    // coords. Clear it; the auto-geocode effect below
+                    // will fetch a fresh one for the new position.
                     intermediates = intermediates.map {
-                        if (it.id == id) it.copy(lat = lat, lon = lon) else it
+                        if (it.id == id) it.copy(lat = lat, lon = lon, label = null) else it
                     }
-                },
-                onRemove = { id ->
-                    intermediates = intermediates.filterNot { it.id == id }
                 },
             )
         }
@@ -614,6 +636,7 @@ fun MapScreen(
                         plannedGpx = null
                         intermediates = emptyList()
                         startOverride = null
+                        startLabel = "Your location"
                         statusMessage = null
                         uploadState = UploadButtonState.Idle
                         clearDestination(mapView)
@@ -659,20 +682,6 @@ fun MapScreen(
             )
         }
 
-        // Lightweight status toast at the bottom-edge above the card.
-        statusMessage?.let { msg ->
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 88.dp)
-                    .clickable { statusMessage = null }
-                    .testTag("status_toast"),
-                color = MaterialTheme.colorScheme.secondaryContainer,
-                shape = RoundedCornerShape(20.dp),
-            ) {
-                Text(msg, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
-            }
-        }
     }
 }
 
@@ -707,43 +716,6 @@ internal fun BottomEndFabs(
             modifier = Modifier.testTag("settings_fab"),
         ) {
             Icon(Icons.Default.Settings, contentDescription = "Settings")
-        }
-    }
-}
-
-@Composable
-private fun SuggestionRow(result: SearchResult, onClick: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 12.dp)
-            .testTag("suggestion_${result.name}"),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            Icons.Default.LocationOn,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(20.dp),
-        )
-        Column(Modifier.weight(1f)) {
-            Text(result.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-            if (result.description.isNotBlank()) {
-                Text(
-                    result.description,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-        result.distanceM?.let { dist ->
-            Text(
-                formatDistance(dist),
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
         }
     }
 }
@@ -926,6 +898,16 @@ private sealed interface ButtonLeading {
 internal data class Destination(val label: String, val lat: Double, val lon: Double)
 
 /**
+ * One-shot record of a map tap that should surface the
+ * Set-destination / Add-stop popup. Captures both the GeoPoint (so
+ * the eventual pick still routes to the right place if the map has
+ * panned) and the pixel coordinates at tap time (so the popup
+ * anchors to where the user actually pressed, not the new screen
+ * position of the GeoPoint after a pan).
+ */
+internal data class PendingTap(val geo: GeoPoint, val pixelX: Int, val pixelY: Int)
+
+/**
  * Auto-plan the route whenever the user's *intent* changes —
  * destination, vias, or an explicit start override — and once when
  * the first GPS fix arrives. Subsequent drift in [currentLocation]
@@ -998,6 +980,14 @@ internal data class Waypoint(
     val id: Long,
     val lat: Double,
     val lon: Double,
+    /**
+     * Reverse-geocoded place name (Photon's "nearest point"). Null
+     * while the geocoding round-trip is in flight or if it failed —
+     * the top-bar row falls back to "Stop N" in that case. Kept
+     * optional so existing instrumented tests that pass
+     * `Waypoint(id, lat, lon)` still compile.
+     */
+    val label: String? = null,
 )
 
 /**
@@ -1037,27 +1027,28 @@ private fun clearDestination(mapView: MapView) {
 }
 
 /**
- * Re-render the full set of intermediate-stop markers. Each is
- * draggable (move → re-plan) and clickable (tap → remove). Cheaper
- * to wipe and re-add than to diff: 0–8 markers per redraw.
+ * Re-render the full set of intermediate-stop markers. Draggable so
+ * the user can refine each stop's position. Removal is no longer a
+ * marker-tap gesture — that moved to the top bar's X button when the
+ * stops sheet replaced the single search bar; tapping the marker now
+ * does nothing on purpose so a stray tap can't silently drop a stop.
+ * Cheaper to wipe and re-add than to diff: 0–8 markers per redraw.
  */
 private fun setIntermediates(
     mapView: MapView,
     waypoints: List<Waypoint>,
     hitboxSizeDp: Int,
     onMove: (id: Long, lat: Double, lon: Double) -> Unit,
-    onRemove: (id: Long) -> Unit,
 ) {
     mapView.overlays.removeAll { it is Marker && it.title?.startsWith(INTERMEDIATE_MARKER_PREFIX) == true }
     for ((index, w) in waypoints.withIndex()) {
         val m = draggableMarker(
             mapView = mapView,
             titleField = "$INTERMEDIATE_MARKER_PREFIX${w.id}",
-            snippetField = "Stop ${index + 1} • tap to remove",
+            snippetField = w.label ?: "Stop ${index + 1}",
             position = GeoPoint(w.lat, w.lon),
             hitboxSizeDp = hitboxSizeDp,
             onDragEnd = { lat, lon -> onMove(w.id, lat, lon) },
-            onClick = { onRemove(w.id) },
         )
         mapView.overlays.add(m)
     }
@@ -1081,12 +1072,6 @@ private fun drawRoute(mapView: MapView, gpxBytes: ByteArray) {
     }
     mapView.overlays.add(poly)
     mapView.invalidate()
-}
-
-private fun formatDistance(meters: Double): String = when {
-    meters < 1_000 -> "${meters.toInt()} m"
-    meters < 10_000 -> "%.1f km".format(meters / 1_000.0)
-    else -> "${(meters / 1_000.0).toInt()} km"
 }
 
 private const val DEST_MARKER_TITLE = "Destination"
