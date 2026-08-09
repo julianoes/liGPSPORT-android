@@ -396,7 +396,8 @@ them — they're already encoded in code.
    downloads of one activity diverged at byte 210,572 of 296,853,
    one holding a valid `TYPE_REQUEST` frame (service=3) and the
    other ride data, the files matching exactly at a 20-byte
-   shift.
+   shift. Downloaded FITs are now checked against their own CRC
+   (`route/FitFile.kt`) so a repeat of this fails loudly.
 
 ## Test strategy
 
