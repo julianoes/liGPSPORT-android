@@ -611,10 +611,15 @@ object UploadPipeline {
     private fun saveActivityFit(context: Context, timestamp: Long, content: ByteArray): java.io.File {
         // Scoped external storage — no runtime permissions needed.
         val dir = java.io.File(context.getExternalFilesDir(null), "activities").apply { mkdirs() }
-        val nameFmt = SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", Locale.US).apply {
+        val nameFmt = SimpleDateFormat("yyyyMMdd'T'HHmmss", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }
-        val fileName = "${nameFmt.format(Date(timestamp * 1000L))}.fit"
+        // Device timestamps count from the FIT epoch, not the Unix one.
+        // No trailing 'Z': the device's list timestamps read as local
+        // wall-clock, so stamping them UTC would be a lie. See
+        // FitFile.garminToUnixSeconds.
+        val unix = FitFile.garminToUnixSeconds(timestamp)
+        val fileName = "${nameFmt.format(Date(unix * 1000L))}.fit"
         val out = java.io.File(dir, fileName)
         out.writeBytes(content)
         return out

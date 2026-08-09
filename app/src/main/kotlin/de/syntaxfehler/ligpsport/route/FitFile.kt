@@ -23,6 +23,27 @@ package de.syntaxfehler.ligpsport.route
  */
 object FitFile {
 
+    /**
+     * Seconds between the Unix epoch and the FIT/Garmin one
+     * (1989-12-31T00:00:00Z). Timestamps on the wire — both inside FIT
+     * files and in the BSC200's `CYCLING_DATA LIST_GET` entries — count
+     * from the latter, so reading one as a Unix time lands you 20 years
+     * early.
+     */
+    const val GARMIN_EPOCH_OFFSET_SECONDS = 631_065_600L
+
+    /**
+     * Convert a device/FIT timestamp to Unix epoch seconds.
+     *
+     * Caveat worth knowing: the BSC200's activity-list timestamps appear
+     * to be *local* wall-clock, while `file_id.time_created` inside the
+     * FIT is UTC — observed 12 h apart on a UTC+12 device. This function
+     * only shifts the epoch; it cannot know the device's timezone, so a
+     * converted list timestamp is the rider's local reading, not a true
+     * instant.
+     */
+    fun garminToUnixSeconds(timestamp: Long): Long = timestamp + GARMIN_EPOCH_OFFSET_SECONDS
+
     /** Nibble-wise CRC-16 table from the FIT SDK. */
     private val CRC_TABLE = intArrayOf(
         0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401,

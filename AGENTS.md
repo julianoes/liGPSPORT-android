@@ -398,6 +398,16 @@ them — they're already encoded in code.
    shift. Downloaded FITs are now checked against their own CRC
    (`route/FitFile.kt`) so a repeat of this fails loudly.
 
+10. **Activity timestamps are FIT-epoch** (seconds from
+    1989-12-31), not Unix — reading one directly puts the ride 20
+    years early. They also appear to be *local* wall-clock: on a
+    UTC+12 device the list timestamp sat exactly 12 h from the
+    FIT's own UTC `file_id.time_created`. Convert with
+    `FitFile.garminToUnixSeconds` and format in UTC to reproduce
+    the head unit's own reading. The raw value is the activity's
+    identifier for `FILE_GET` / `FILE_DEL`, so never convert it
+    before sending it back to the device.
+
 ## Test strategy
 
 Three layers, each with a different cost/coverage trade.
