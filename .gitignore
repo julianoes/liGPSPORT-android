@@ -30,6 +30,11 @@ keystore.properties
 # Tracked sibling `agps.properties.example` documents the format.
 app/agps.properties
 
+# Strava API application credentials — see docs/STRAVA.md. Baked into
+# BuildConfig.STRAVA_CLIENT_ID / _SECRET at build time. Tracked sibling
+# `strava.properties.example` documents the format.
+app/strava.properties
+
 # Misc
 .DS_Store
 *.log
