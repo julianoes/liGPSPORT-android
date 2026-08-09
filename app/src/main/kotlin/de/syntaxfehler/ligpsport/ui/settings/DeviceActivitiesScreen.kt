@@ -50,6 +50,7 @@ import androidx.core.content.FileProvider
 import de.syntaxfehler.ligpsport.ble.DeviceStore
 import de.syntaxfehler.ligpsport.ble.FileTransfer
 import de.syntaxfehler.ligpsport.ble.UploadPipeline
+import de.syntaxfehler.ligpsport.route.FitFile
 import de.syntaxfehler.ligpsport.strava.StravaStore
 import de.syntaxfehler.ligpsport.strava.StravaUploader
 import kotlinx.coroutines.Dispatchers
@@ -59,6 +60,7 @@ import java.io.File
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 /**
  * "Activities on device" sub-screen — list / download (FIT) / share /
@@ -514,9 +516,16 @@ private fun ActivityRow(
     }
 }
 
-private fun formatActivityTimestamp(epochSeconds: Long): String =
+/**
+ * Device timestamps are FIT-epoch seconds, and read as the rider's
+ * local wall-clock rather than UTC — so convert the epoch, then format
+ * in UTC to reproduce the reading the head unit itself shows. Applying
+ * the phone's timezone here would shift it a second time.
+ */
+private fun formatActivityTimestamp(deviceTimestamp: Long): String =
     DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT, Locale.getDefault())
-        .format(Date(epochSeconds * 1000L))
+        .apply { timeZone = TimeZone.getTimeZone("UTC") }
+        .format(Date(FitFile.garminToUnixSeconds(deviceTimestamp) * 1000L))
 
 private fun formatKiB(bytes: Long): String =
     if (bytes <= 0) "0 KiB"

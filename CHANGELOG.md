@@ -66,6 +66,12 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   verifies the FIT's structure and both CRCs (new `route/FitFile.kt`)
   and reports `corrupt download: …` rather than saving a bad file that
   only fails much later, somewhere else.
+- **Activity dates were twenty years out.** Device timestamps count
+  from the FIT epoch (1989-12-31), not the Unix one, so the activities
+  list and the saved filenames showed 2006 for a 2026 ride. Note the
+  device's list timestamps read as local wall-clock rather than UTC —
+  observed 12 h from the FIT's own `time_created` on a UTC+12 device —
+  so filenames no longer carry a misleading `Z` suffix.
 
 ## [1.2.0] — 2026-05-17
 

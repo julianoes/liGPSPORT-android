@@ -81,4 +81,17 @@ class FitFileTest {
     fun crc_matches_known_vector() {
         assertThat(FitFile.crc16("123456789".toByteArray())).isEqualTo(0xBB3D)
     }
+
+    /**
+     * Regression: a real BSC300T activity-list timestamp. Read as Unix
+     * it lands in 2006; the FIT epoch puts it where the ride actually
+     * happened.
+     */
+    @Test
+    fun converts_device_timestamp_from_fit_epoch() {
+        val fromDevice = 1_154_857_246L
+        assertThat(FitFile.garminToUnixSeconds(fromDevice)).isEqualTo(1_785_922_846L)
+        // 1785922846 == 2026-08-05T09:40:46Z, twenty years on from the
+        // 2006 date the raw value decodes to.
+    }
 }
