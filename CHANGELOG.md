@@ -6,6 +6,21 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- **Share button per recorded activity** (Settings → Activities on
+  device) — hands the FIT to the Android share sheet, so a ride can go
+  to Drive, email or Nearby Share without an `adb pull`. Reuses an
+  already-downloaded file when one exists, otherwise pulls it off the
+  device first, so it works as a single tap. Backed by a new
+  `FileProvider` (`${applicationId}.fileprovider`) scoped to
+  `getExternalFilesDir(null)/activities/` via `@xml/file_paths`, and
+  `UploadPipeline.activityFitFile` which exposes the deterministic
+  download path so callers can skip a redundant BLE transfer.
+  The chooser advertises `application/octet-stream` rather than
+  `application/vnd.ant.fit` — near-nothing declares a filter for the
+  registered FIT type, so the correct MIME produces an empty chooser.
+
 ## [1.2.0] — 2026-05-17
 
 Recorded-activities management on top of v1.1.0's route editing,

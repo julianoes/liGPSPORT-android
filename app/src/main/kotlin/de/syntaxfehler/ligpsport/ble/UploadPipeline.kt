@@ -595,14 +595,25 @@ object UploadPipeline {
         }
     }
 
-    private fun saveActivityFit(context: Context, timestamp: Long, content: ByteArray): java.io.File {
-        // Scoped external storage — no runtime permissions needed.
-        val dir = java.io.File(context.getExternalFilesDir(null), "activities").apply { mkdirs() }
+    /**
+     * Where [downloadActivity] puts the FIT for `timestamp`. Exposed so
+     * callers can check for an already-downloaded file and skip a second
+     * BLE transfer — activity downloads are slow enough (tens of seconds
+     * for a long ride) that re-fetching one just to share it is worth
+     * avoiding. The file may not exist; check before use.
+     */
+    fun activityFitFile(context: Context, timestamp: Long): java.io.File {
+        val dir = java.io.File(context.getExternalFilesDir(null), "activities")
         val nameFmt = SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }
-        val fileName = "${nameFmt.format(Date(timestamp * 1000L))}.fit"
-        val out = java.io.File(dir, fileName)
+        return java.io.File(dir, "${nameFmt.format(Date(timestamp * 1000L))}.fit")
+    }
+
+    private fun saveActivityFit(context: Context, timestamp: Long, content: ByteArray): java.io.File {
+        // Scoped external storage — no runtime permissions needed.
+        val out = activityFitFile(context, timestamp)
+        out.parentFile?.mkdirs()
         out.writeBytes(content)
         return out
     }

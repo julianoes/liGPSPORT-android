@@ -1,5 +1,8 @@
 package de.syntaxfehler.ligpsport.ui.settings
 
+import android.content.Context
+import android.content.Intent
+import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -14,6 +17,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
@@ -41,24 +45,27 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import de.syntaxfehler.ligpsport.ble.DeviceStore
 import de.syntaxfehler.ligpsport.ble.FileTransfer
 import de.syntaxfehler.ligpsport.ble.UploadPipeline
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
- * "Activities on device" sub-screen — list / download (FIT) / delete
- * recorded activities from the BSC200. Mirrors [DeviceRoutesScreen].
+ * "Activities on device" sub-screen — list / download (FIT) / share /
+ * delete recorded activities from the BSC200. Mirrors [DeviceRoutesScreen].
  *
  * testTags (stable, used by instrumented tests + adb harness):
  *   - `refresh_activities`
  *   - `activity_<timestamp>`
- *   - `download_activity_<timestamp>` / `delete_activity_<timestamp>`
+ *   - `download_activity_<timestamp>` / `share_activity_<timestamp>` /
+ *     `delete_activity_<timestamp>`
  *   - `delete_all_activities`
  *   - `confirm_delete_all_activities`
  */
@@ -76,6 +83,7 @@ fun DeviceActivitiesScreen(onBack: () -> Unit) {
     var confirmDeleteAll by remember { mutableStateOf(false) }
     var deletingAll by remember { mutableStateOf(false) }
     var downloadingTs by remember { mutableStateOf<Long?>(null) }
+    var sharingTs by remember { mutableStateOf<Long?>(null) }
     val snackbar = remember { SnackbarHostState() }
 
     fun refresh() {
@@ -88,6 +96,57 @@ fun DeviceActivitiesScreen(onBack: () -> Unit) {
                 is UploadPipeline.Result.Failure -> error = res.reason
             }
             loading = false
+        }
+    }
+
+    /**
+     * Share the FIT for [entry]. Reuses the already-downloaded file when
+     * there is one, otherwise pulls it off the device first — so the
+     * share button works as a one-tap "get this ride out of the app"
+     * without forcing a separate download tap.
+     */
+    fun share(entry: FileTransfer.ActivityListEntry) {
+        sharingTs = entry.timestamp
+        scope.launch {
+            val cached = UploadPipeline.activityFitFile(ctx, entry.timestamp)
+            val haveIt = withContext(Dispatchers.IO) { cached.isFile && cached.length() > 0L }
+            // Fire-and-forget: showSnackbar() suspends until the snackbar is
+            // dismissed, so awaiting it would stall the fetch it announces.
+            // Worth saying out loud — the BLE pull takes tens of seconds and
+            // otherwise reads as a hung button.
+            if (!haveIt) scope.launch { snackbar.showSnackbar("Fetching FIT from the device…") }
+
+            val outcome = withContext(Dispatchers.IO) {
+                if (haveIt) {
+                    ShareOutcome.Ready(cached)
+                } else {
+                    when (val res = UploadPipeline.downloadActivity(ctx, entry.timestamp)) {
+                        is UploadPipeline.Result.Success ->
+                            ShareOutcome.Ready(res.activitySavedPath?.let(::File) ?: cached)
+                        is UploadPipeline.Result.Failure -> ShareOutcome.Error(res.reason)
+                    }
+                }
+            }
+            sharingTs = null
+            when (outcome) {
+                is ShareOutcome.Ready -> {
+                    // Two distinct failures, easily collapsed into one
+                    // misleading message: building the content URI (missing
+                    // file / FileProvider root mismatch) vs. nothing on the
+                    // phone accepting the intent.
+                    val intent = runCatching { shareFitIntent(ctx, outcome.file) }.getOrElse { e ->
+                        Log.w(TAG, "share: cannot build content URI for ${outcome.file}", e)
+                        snackbar.showSnackbar("Can't share ${outcome.file.name}: ${e.message}")
+                        return@launch
+                    }
+                    runCatching { ctx.startActivity(intent) }.onFailure { e ->
+                        Log.w(TAG, "share: no activity accepted the FIT share intent", e)
+                        snackbar.showSnackbar("No app on this phone accepts a FIT file")
+                    }
+                }
+                is ShareOutcome.Error ->
+                    snackbar.showSnackbar("Couldn't fetch the FIT: ${outcome.reason}")
+            }
         }
     }
 
@@ -174,6 +233,8 @@ fun DeviceActivitiesScreen(onBack: () -> Unit) {
                     ActivityRow(
                         entry = e,
                         downloading = downloadingTs == e.timestamp,
+                        sharing = sharingTs == e.timestamp,
+                        onShare = { share(e) },
                         onDownload = {
                             downloadingTs = e.timestamp
                             scope.launch {
@@ -290,10 +351,40 @@ fun DeviceActivitiesScreen(onBack: () -> Unit) {
     }
 }
 
+private const val TAG = "DeviceActivities"
+
+private sealed interface ShareOutcome {
+    data class Ready(val file: File) : ShareOutcome
+    data class Error(val reason: String) : ShareOutcome
+}
+
+/**
+ * ACTION_SEND chooser for a downloaded FIT.
+ *
+ * MIME is `application/octet-stream` rather than the registered
+ * `application/vnd.ant.fit` on purpose: almost nothing declares an
+ * intent-filter for the FIT type, so the correct MIME yields an empty
+ * chooser. octet-stream is what the receiving apps (Drive, Gmail,
+ * Nearby Share) actually match on — the same reason this app's own
+ * ShareImportActivity accepts it for inbound GPX.
+ */
+private fun shareFitIntent(ctx: Context, file: File): Intent {
+    val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "application/octet-stream"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        putExtra(Intent.EXTRA_TITLE, file.name)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    return Intent.createChooser(send, "Share activity")
+}
+
 @Composable
 private fun ActivityRow(
     entry: FileTransfer.ActivityListEntry,
     downloading: Boolean,
+    sharing: Boolean,
+    onShare: () -> Unit,
     onDownload: () -> Unit,
     onDelete: () -> Unit,
 ) {
@@ -322,7 +413,7 @@ private fun ActivityRow(
             }
             IconButton(
                 onClick = onDownload,
-                enabled = !downloading,
+                enabled = !downloading && !sharing,
                 modifier = Modifier.testTag("download_activity_${entry.timestamp}"),
             ) {
                 if (downloading) {
@@ -332,7 +423,19 @@ private fun ActivityRow(
                 }
             }
             IconButton(
+                onClick = onShare,
+                enabled = !downloading && !sharing,
+                modifier = Modifier.testTag("share_activity_${entry.timestamp}"),
+            ) {
+                if (sharing) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Filled.Share, contentDescription = "Share FIT")
+                }
+            }
+            IconButton(
                 onClick = onDelete,
+                enabled = !downloading && !sharing,
                 modifier = Modifier.testTag("delete_activity_${entry.timestamp}"),
             ) {
                 Icon(Icons.Filled.Delete, contentDescription = "Delete activity")
