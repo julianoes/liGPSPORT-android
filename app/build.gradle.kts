@@ -42,6 +42,32 @@ android {
             else -> System.getenv("LIGPSPORT_AGPS_TOKEN") ?: ""
         }
         buildConfigField("String", "AGPS_TOKEN", "\"${agpsToken}\"")
+
+        // Strava API application credentials — used by the "Send to
+        // Strava" action on recorded activities. See docs/STRAVA.md.
+        //
+        // Same resolution order as the AGPS token above:
+        //   1. `strava.properties` next to this file (gitignored).
+        //   2. `LIGPSPORT_STRAVA_CLIENT_ID` / `_SECRET` env vars.
+        //   3. Empty — the Strava UI hides itself entirely.
+        //
+        // The secret ends up in the APK; Strava requires it for the
+        // token exchange and has no PKCE alternative. Fine for a
+        // personal build, not for one you hand out.
+        val stravaPropsFile = file("strava.properties")
+        val stravaProps: Properties? = if (stravaPropsFile.isFile) {
+            Properties().apply { stravaPropsFile.inputStream().use { load(it) } }
+        } else {
+            null
+        }
+        val stravaClientId: String =
+            stravaProps?.getProperty("client_id")?.trim()
+                ?: System.getenv("LIGPSPORT_STRAVA_CLIENT_ID") ?: ""
+        val stravaClientSecret: String =
+            stravaProps?.getProperty("client_secret")?.trim()
+                ?: System.getenv("LIGPSPORT_STRAVA_CLIENT_SECRET") ?: ""
+        buildConfigField("String", "STRAVA_CLIENT_ID", "\"${stravaClientId}\"")
+        buildConfigField("String", "STRAVA_CLIENT_SECRET", "\"${stravaClientSecret}\"")
     }
 
     // The release keystore is provided via environment variables when

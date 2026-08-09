@@ -1,0 +1,21 @@
+# Template for `strava.properties`. Copy this file to
+# `strava.properties` (gitignored sibling, same directory) and fill in
+# the credentials from https://www.strava.com/settings/api. See
+# `docs/STRAVA.md` for the full registration walkthrough.
+#
+# This file is the primary source for BuildConfig.STRAVA_CLIENT_ID and
+# BuildConfig.STRAVA_CLIENT_SECRET — it overrides the
+# LIGPSPORT_STRAVA_CLIENT_ID / LIGPSPORT_STRAVA_CLIENT_SECRET env vars
+# when present. Leave both empty (or delete `strava.properties`) and
+# the Strava upload feature stays hidden in the UI.
+#
+# The secret is embedded in the APK: Strava requires client_secret for
+# the token exchange and does not support PKCE, so there is nowhere
+# else for it to live in a native app. Don't distribute a build that
+# has real credentials baked in — anyone can extract them and act as
+# your API application. Rotate on the settings page if that happens.
+#
+# The registered "Authorization Callback Domain" must be `localhost`,
+# to match the `ligpsport://localhost` redirect the app uses.
+client_id=
+client_secret=
