@@ -80,6 +80,56 @@ nix run .#run-instrumented-tests
 nix run .#e2e-test
 ```
 
+## Quick start (plain Gradle, no Nix)
+
+The Nix flake is the supported path, but the project builds fine with a
+stock JDK 17 + Android SDK. Two things are *not* in the repo and have to
+be supplied once:
+
+- **No Gradle wrapper is checked in** (`gradle/` holds only
+  `libs.versions.toml`). Use Gradle **8.9–8.10.2**: 8.9 is AGP 8.7.2's
+  minimum, and 8.10 is the newest Gradle that Kotlin 2.0.21's Gradle
+  plugin is tested against. Newer 8.x usually works but is untested;
+  Gradle 9.x is a hard no — it requires AGP 9.0+, which is a real
+  migration (new DSL, variant API removal, KGP 2.2.x, build-tools 36).
+- **`compileSdk = 34`**, so `platforms;android-34` must be installed —
+  a stock SDK with only 33/35 will fail to configure.
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk"
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+
+# 1. SDK bits (note: use the SDK's sdkmanager — on some hosts /usr/bin/sdkmanager
+#    is NVIDIA's unrelated Jetson tool)
+sdkmanager "platforms;android-34" "build-tools;34.0.0"
+sdkmanager --licenses
+echo "sdk.dir=$HOME/Android/Sdk" > local.properties
+
+# 2. Gradle, one-off — then generate the wrapper so later builds don't need it
+mkdir -p ~/gradle-dist && cd ~/gradle-dist
+curl -LO https://services.gradle.org/distributions/gradle-8.10.2-bin.zip
+unzip -q gradle-8.10.2-bin.zip
+export PATH="$HOME/gradle-dist/gradle-8.10.2/bin:$PATH"
+cd -
+gradle wrapper --gradle-version 8.10.2
+
+# 3. Build → app/build/outputs/apk/debug/app-debug.apk
+./gradlew assembleDebug
+```
+
+Afterwards only `JAVA_HOME` / `ANDROID_HOME` are needed:
+
+```sh
+./gradlew test             # JVM unit tests (hermetic)
+./gradlew installDebug     # build + install on the attached device
+./gradlew assembleRelease  # R8-minified; debug keystore unless KEYSTORE_* is set
+```
+
+The first build downloads a `protoc` binary via the `protobuf` Gradle
+plugin, so it needs network access even though the tests themselves
+are hermetic.
+
 ## Architecture
 
 | Layer | Where |
