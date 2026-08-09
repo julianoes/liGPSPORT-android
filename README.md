@@ -34,6 +34,10 @@ authoritative wire spec lives in that repo's `docs/PROTOCOL.md`.
   firmware-protected and gets a guard dialog (PROTOCOL.md §7.4).
 - **OsmAnd share**: share a GPX track from OsmAnd via the Android
   share sheet to upload it straight to the device.
+- **Recorded activities off the device**: Settings → Activities on
+  device lists what the BSC200 has recorded, and each row can
+  download the FIT or push it straight into the Android share sheet
+  (Drive, email, Nearby Share).
 - **AGPS pre-seeding**: every route upload silently piggybacks
   ~2.5 KB of u-blox AssistNow ephemeris (`file_type=AGPS(7)`) before
   the route bytes — gives the BSC200's GNSS chip a hot start without
