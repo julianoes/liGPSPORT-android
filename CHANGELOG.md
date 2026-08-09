@@ -26,6 +26,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
     the two files matching exactly at a 20-byte shift.
   - Frame removal now uses one `subList().clear()` instead of
     `removeAt(0)` in a loop, which was O(n²) on a 300 KB transfer.
+- **Downloads no longer fail silently.** `UploadPipeline.downloadActivity`
+  verifies the FIT's structure and both CRCs (new `route/FitFile.kt`)
+  and reports `corrupt download: …` rather than saving a bad file that
+  only fails much later, somewhere else.
 
 ## [1.2.0] — 2026-05-17
 
