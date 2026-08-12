@@ -6,6 +6,42 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- **Send recorded activities to Strava** (Settings → Activities on
+  device → cloud button). Fetches the FIT over BLE if it isn't already
+  cached, refreshes the OAuth token when stale, POSTs to
+  `/api/v3/uploads`, then polls until Strava has turned the upload into
+  an activity. `external_id` is the FIT filename, so re-uploading a
+  ride is rejected as a duplicate rather than creating a twin.
+  Connect / disconnect lives in Settings → Strava, which hides itself
+  entirely when the build has no API credentials.
+  See [docs/STRAVA.md](docs/STRAVA.md).
+  - Uploads are muted from followers' feeds via `hide_from_home`, so
+    they raise no notifications. This is **not** privacy: Strava's
+    Everyone/Followers/Only You visibility isn't exposed through the
+    API and the old `private` upload flag is defunct. Set the account
+    default on Strava if you need that.
+  - Credentials come from a gitignored `app/strava.properties` (or
+    `LIGPSPORT_STRAVA_CLIENT_ID` / `_SECRET`), mirroring the existing
+    AGPS token wiring. The client secret is baked into the APK because
+    Strava requires it for the token exchange and offers no PKCE —
+    don't distribute a build carrying real credentials.
+  - Sharing a FIT into the Strava app is not an alternative: its only
+    `ACTION_SEND` filters are `text/plain` and `image/*`.
+- **Share button per recorded activity** (Settings → Activities on
+  device) — hands the FIT to the Android share sheet, so a ride can go
+  to Drive, email or Nearby Share without an `adb pull`. Reuses an
+  already-downloaded file when one exists, otherwise pulls it off the
+  device first, so it works as a single tap. Backed by a new
+  `FileProvider` (`${applicationId}.fileprovider`) scoped to
+  `getExternalFilesDir(null)/activities/` via `@xml/file_paths`, and
+  `UploadPipeline.activityFitFile` which exposes the deterministic
+  download path so callers can skip a redundant BLE transfer.
+  The chooser advertises `application/octet-stream` rather than
+  `application/vnd.ant.fit` — near-nothing declares a filter for the
+  registered FIT type, so the correct MIME produces an empty chooser.
+
 ### Fixed
 
 - **Corrupted activity downloads.** `BleTransport` accumulated

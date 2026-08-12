@@ -285,7 +285,8 @@ The instrumented tests + adb harness identify UI surfaces by
 | `routes_list` / `refresh_routes` / `delete_all_routes` / `confirm_delete_all` | DeviceRoutesScreen surface + actions |
 | `route_<id>` / `delete_route_<id>` | Per-route row + its delete icon button (DeviceRoutesScreen) |
 | `activities_list` / `refresh_activities` / `delete_all_activities` / `confirm_delete_all_activities` | DeviceActivitiesScreen surface + actions |
-| `activity_<timestamp>` / `download_activity_<timestamp>` / `delete_activity_<timestamp>` | Per-activity row + its action icon buttons (DeviceActivitiesScreen) |
+| `activity_<timestamp>` / `download_activity_<timestamp>` / `share_activity_<timestamp>` / `strava_activity_<timestamp>` / `delete_activity_<timestamp>` | Per-activity row + its action icon buttons (DeviceActivitiesScreen). The Strava button only renders when the build has credentials *and* an account is connected. |
+| `strava_card` / `strava_connect` / `strava_disconnect` | Settings → Strava section (absent unless `BuildConfig.STRAVA_CLIENT_ID`/`_SECRET` are non-blank) |
 
 ## Routing providers
 

@@ -61,6 +61,8 @@ import de.syntaxfehler.ligpsport.ble.DeviceStore
 import de.syntaxfehler.ligpsport.data.RouterPreferences
 import de.syntaxfehler.ligpsport.route.RouteProvider
 import de.syntaxfehler.ligpsport.route.RouterRegistry
+import de.syntaxfehler.ligpsport.strava.StravaAuth
+import de.syntaxfehler.ligpsport.strava.StravaStore
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -161,6 +163,13 @@ fun SettingsScreen(
                     onClick = onOpenActivities,
                     testTag = "open_device_activities",
                 )
+            }
+
+            // --- Strava ---------------------------------------------
+            // Hidden entirely when the build has no API credentials —
+            // a connect button that can only fail is worse than nothing.
+            if (StravaStore.isConfigured()) {
+                item { StravaSection() }
             }
 
             // --- Map markers ----------------------------------------
@@ -548,6 +557,89 @@ private fun Chip(text: String) {
     ) {
         Box(Modifier.padding(horizontal = 8.dp, vertical = 2.dp)) {
             Text(text, style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
+/**
+ * Strava connect / disconnect. Only rendered when the build carries API
+ * credentials ([StravaStore.isConfigured]).
+ *
+ * Connect fires an implicit intent that the Strava app or the browser
+ * picks up; the redirect lands in
+ * [de.syntaxfehler.ligpsport.ui.strava.StravaAuthActivity], which does
+ * the token exchange. Because that happens in a different activity,
+ * this section re-reads the store on resume to reflect the result.
+ *
+ * testTags: `strava_card`, `strava_connect`, `strava_disconnect`.
+ */
+@Composable
+private fun StravaSection() {
+    val ctx = LocalContext.current
+    val store = remember { StravaStore(ctx) }
+    var connected by remember { mutableStateOf(store.isConnected()) }
+    var athlete by remember { mutableStateOf(store.athleteName()) }
+
+    @Suppress("DEPRECATION")
+    val lifecycle = androidx.compose.ui.platform.LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(lifecycle) {
+        val obs = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                connected = store.isConnected()
+                athlete = store.athleteName()
+            }
+        }
+        lifecycle.addObserver(obs)
+        onDispose { lifecycle.removeObserver(obs) }
+    }
+
+    Column {
+        SectionLabel("Strava")
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp)
+                .testTag("strava_card"),
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    if (connected) "Connected${athlete?.let { " as $it" } ?: ""}" else "Not connected",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    if (connected) {
+                        "Recorded activities can be sent straight to Strava " +
+                            "from Activities on device."
+                    } else {
+                        "Connect to send recorded activities to Strava without " +
+                            "going through a computer."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (connected) {
+                    OutlinedButton(
+                        onClick = {
+                            store.clear()
+                            connected = false
+                            athlete = null
+                        },
+                        modifier = Modifier.testTag("strava_disconnect"),
+                    ) { Text("Disconnect") }
+                    Text(
+                        "Disconnecting only forgets the token on this phone. " +
+                            "Revoke access at strava.com/settings/apps.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    OutlinedButton(
+                        onClick = { ctx.startActivity(StravaAuth.authorizeIntent()) },
+                        modifier = Modifier.testTag("strava_connect"),
+                    ) { Text("Connect to Strava") }
+                }
+            }
         }
     }
 }

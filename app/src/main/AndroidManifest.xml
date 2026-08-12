@@ -61,6 +61,42 @@
             </intent-filter>
         </activity>
 
+        <!-- Grants short-lived read URIs on downloaded FIT files so the
+             activities screen can hand one to the share sheet. Scoped to
+             `activities/` via @xml/file_paths; not exported. The
+             `${applicationId}` placeholder keeps debug builds (which get
+             the `.debug` suffix) from colliding with a release install. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- Strava OAuth redirect target. The custom scheme stands in for
+             a real callback domain, which a native app doesn't have; the
+             registered "Authorization Callback Domain" must be
+             `localhost` to match. See strava/StravaAuth.kt.
+
+             NOT Theme.NoDisplay: that requires finish() before onResume()
+             returns, and the token exchange is a network round-trip, so
+             the framework force-finishes the activity mid-flight. -->
+        <activity
+            android:name=".ui.strava.StravaAuthActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="ligpsport" android:host="localhost" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".service.UploadForegroundService"
             android:exported="false"
