@@ -1,5 +1,7 @@
 # ligpsport-android
 
+<img src="ligpsport-icon-512.png" alt="" width="96" align="right">
+
 Native Android app that plans bike routes and uploads them to iGPSPORT
 cycling computers (BSC200 and family) over BLE — then flips the device
 into navigation mode automatically. No iGPSPORT cloud account required.
