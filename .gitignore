@@ -30,6 +30,10 @@ keystore.properties
 # Tracked sibling `agps.properties.example` documents the format.
 app/agps.properties
 
+# Strava API application credentials — client id / secret for a Strava
+# API application. Never commit one.
+app/strava.properties
+
 # Misc
 .DS_Store
 *.log
