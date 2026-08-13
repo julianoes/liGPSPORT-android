@@ -120,6 +120,19 @@ reliable again.
   within a recently-loaded area.
 - Route distance is parsed once per planned GPX rather than on every
   recomposition.
+- **AGPS data is only re-seeded when it has actually gone stale.**
+  Every upload used to download a fresh AssistNow payload and push it
+  over BLE first, which dominated the time an upload took — and bought
+  nothing, since u-blox ephemeris data stays usable for hours. The
+  last successful seed is now recorded per device (`AgpsSeedStore`)
+  and both halves are skipped while it is younger than two hours.
+  Only a payload the device accepted counts, so a rejected or dropped
+  transfer still retries on the next upload; the record survives
+  unpairing like the device nickname does; and a fan-out to several
+  devices now downloads the payload once instead of once per device.
+  Settings shows each device's last-seed time and remaining validity,
+  with a **Seed now** button that ignores the freshness check for the
+  case where a computer still refuses to get a fix.
 
 ## [1.2.0] — 2026-05-17
 

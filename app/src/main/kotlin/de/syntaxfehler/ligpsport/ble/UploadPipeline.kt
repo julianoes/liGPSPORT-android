@@ -14,6 +14,8 @@ import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
 import de.syntaxfehler.ligpsport.BuildConfig
 import de.syntaxfehler.ligpsport.agps.AgpsClient
+import de.syntaxfehler.ligpsport.data.AgpsSeedStore
+import de.syntaxfehler.ligpsport.data.AgpsTokenStore
 import de.syntaxfehler.ligpsport.data.MockLocationStore
 import de.syntaxfehler.ligpsport.data.RouterPreferences
 import de.syntaxfehler.ligpsport.route.CnxEncoder
@@ -26,6 +28,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.cancellation.CancellationException
 import java.text.SimpleDateFormat
@@ -183,7 +187,17 @@ object UploadPipeline {
         // can take several seconds, and holding the device's exclusive
         // lease for them would stall the nav-status poll (and, when
         // fanning out, nothing else — the lease is per MAC) for no reason.
-        val agpsData = fetchAgpsOrNull(context)
+        //
+        // The AGPS half is skipped entirely — fetch included — when this
+        // device already holds assistance data that hasn't expired yet.
+        val seedStore = AgpsSeedStore(context)
+        val agpsData = if (seedStore.isFresh(paired.mac)) {
+            val ageMin = (System.currentTimeMillis() - (seedStore.get(paired.mac)?.seededAt ?: 0L)) / 60_000
+            Log.i(TAG, "agps: skipping ${paired.mac} — seeded ${ageMin}min ago, ttl ${seedStore.ttlMs / 60_000}min")
+            null
+        } else {
+            fetchAgpsOrNull(context)
+        }
         val fix = resolveCurrentLocation(context)
 
         return withDevice(context, paired) { transport, _ ->
@@ -191,7 +205,9 @@ object UploadPipeline {
             // assistance data while the user is still putting the bike
             // away. Best-effort: a fetch failure doesn't fail the
             // route upload — we just log it and proceed.
-            val agpsBytes = agpsData?.let { pushAgpsBestEffort(transport, it) }
+            val agpsBytes = agpsData?.let {
+                pushAgpsBestEffort(transport, it, paired.mac, seedStore)
+            }
 
             // Inject the phone's current location as a starting-point
             // prior. AGPS supplies "which satellite is where in orbit";
@@ -303,13 +319,26 @@ object UploadPipeline {
 
     // ---- AGPS pre-seed ------------------------------------------------
 
+    /** Last AssistNow payload we downloaded; see [fetchAgpsOrNull]. */
+    private class CachedAgps(val data: ByteArray, val fetchedAt: Long)
+
+    private val agpsFetchMutex = Mutex()
+    private var cachedAgps: CachedAgps? = null
+
     /**
      * Fetch AssistNow Online data and upload it to the device as
      * `file_type=AGPS`. Standalone entry point used by the
-     * `…action.SEND_AGPS` adb broadcast for headless verification;
-     * the route-upload path fetches and pushes the same bytes inline
-     * (see [fetchAgpsOrNull] / [pushAgpsBestEffort]) so a failure there
-     * doesn't break the route flow.
+     * `…action.SEND_AGPS` adb broadcast and by the Settings "Seed AGPS
+     * now" action; the route-upload path fetches and pushes the same
+     * bytes inline (see [fetchAgpsOrNull] / [pushAgpsBestEffort]) so a
+     * failure there doesn't break the route flow.
+     *
+     * This entry point always fetches and always pushes, even when the
+     * device's existing seed is still fresh: it only runs when a human
+     * (or a test harness) explicitly asked for it, and the reason to ask
+     * is usually "the device still won't get a fix". The freshly-fetched
+     * payload deliberately bypasses the [fetchAgpsOrNull] cache for the
+     * same reason.
      */
     @SuppressLint("MissingPermission")
     suspend fun seedAgps(context: Context, targetMac: String? = null): Result {
@@ -326,6 +355,10 @@ object UploadPipeline {
             val r = pushAgps(transport, data)
             if (r.success) {
                 Log.i(TAG, "agps: seeded ${data.size}B, device status=${r.status}")
+                // Recording the manual seed suppresses the next automatic
+                // one — otherwise "seed now" followed by an upload would
+                // push the same bytes twice.
+                AgpsSeedStore(context).record(paired.mac, data.size)
                 Result.Success(
                     deviceName = paired.name,
                     deviceMac = paired.mac,
@@ -344,19 +377,33 @@ object UploadPipeline {
      *
      * Kept separate from [pushAgpsBestEffort] so the HTTP round-trip
      * happens *before* the device lease is taken.
+     *
+     * The payload is memoised for as long as it stays valid. The
+     * fan-out ([uploadGpxAll]) runs one [uploadGpx] per device in
+     * parallel, and without the cache each of them would fetch its own
+     * copy of the identical assistance data. The mutex makes the losers
+     * of that race wait for the winner's response instead of opening
+     * their own connection.
      */
-    private suspend fun fetchAgpsOrNull(context: Context): ByteArray? {
+    private suspend fun fetchAgpsOrNull(context: Context): ByteArray? = agpsFetchMutex.withLock {
+        val cached = cachedAgps
+        val now = System.currentTimeMillis()
+        if (cached != null && AgpsSeedStore.isFresh(cached.fetchedAt, now, AgpsSeedStore.DEFAULT_TTL_MS)) {
+            Log.i(TAG, "agps: reusing payload fetched ${(now - cached.fetchedAt) / 1000}s ago")
+            return@withLock cached.data
+        }
         val data = try {
             fetchAgps(context)
         } catch (e: Exception) {
             Log.w(TAG, "agps: fetch failed: ${e.message}")
-            return null
+            return@withLock null
         }
         if (data.isEmpty()) {
             Log.w(TAG, "agps: u-blox returned 0 bytes — invalid token?")
-            return null
+            return@withLock null
         }
-        return data
+        cachedAgps = CachedAgps(data, now)
+        data
     }
 
     private suspend fun fetchAgps(context: Context): ByteArray {
@@ -366,9 +413,8 @@ object UploadPipeline {
         //   3. null → AgpsClient falls back to fetching the token
         //      from iGPSport's prod config endpoint, mirroring the
         //      official app.
-        val overrideToken =
-            de.syntaxfehler.ligpsport.data.AgpsTokenStore(context).get()
-                ?: BuildConfig.AGPS_TOKEN.takeIf { it.isNotBlank() }
+        val overrideToken = AgpsTokenStore(context).get()
+            ?: BuildConfig.AGPS_TOKEN.takeIf { it.isNotBlank() }
         val client = AgpsClient()
         return try {
             val t0 = System.currentTimeMillis()
@@ -400,8 +446,17 @@ object UploadPipeline {
     /**
      * Number of AGPS bytes the device accepted, or null when it rejected
      * them. Never throws — the route upload proceeds either way.
+     *
+     * Only a genuinely accepted payload is recorded in [seedStore]: a
+     * rejection or a dropped link must leave the device marked stale so
+     * the next upload tries again.
      */
-    private suspend fun pushAgpsBestEffort(transport: Transport, data: ByteArray): Int? {
+    private suspend fun pushAgpsBestEffort(
+        transport: Transport,
+        data: ByteArray,
+        mac: String,
+        seedStore: AgpsSeedStore,
+    ): Int? {
         val r = try {
             pushAgps(transport, data)
         } catch (e: Exception) {
@@ -410,6 +465,7 @@ object UploadPipeline {
         }
         return if (r.success) {
             Log.i(TAG, "agps: seeded ${data.size}B, device status=${r.status}")
+            seedStore.record(mac, data.size)
             data.size
         } else {
             Log.w(TAG, "agps: device rejected (status=${r.status}): ${r.message}")

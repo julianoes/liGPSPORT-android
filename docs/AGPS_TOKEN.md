@@ -187,5 +187,33 @@ own investigation, currently not exercised by `ligpsport-android`).
   the runtime auto-fetch). Both URLs live in this file as
   `companion object` constants; that's the durable source of truth
   alongside the decompiled APK.
-- `app/src/main/kotlin/de/syntaxfehler/ligpsport/ble/UploadPipeline.kt#uploadAgpsBestEffort`
-  — the piggyback that fires AGPS before every route upload.
+- `app/src/main/kotlin/de/syntaxfehler/ligpsport/ble/UploadPipeline.kt#pushAgpsBestEffort`
+  — the piggyback that fires AGPS before a route upload.
+- `app/src/main/kotlin/de/syntaxfehler/ligpsport/data/AgpsSeedStore.kt`
+  — the per-device freshness gate described below.
+
+## When the piggyback actually runs
+
+AssistNow Online ephemeris data ages out after roughly 2–4 hours, so
+re-sending it on every upload buys nothing and costs an HTTP round-trip
+plus a multi-kilobyte BLE transfer. `AgpsSeedStore` records the
+timestamp of the last payload a device *accepted* and `UploadPipeline`
+skips the whole step — fetch included — while that record is younger
+than `AgpsSeedStore.DEFAULT_TTL_MS` (2 h).
+
+Consequences worth knowing when debugging:
+
+- The record is per MAC. With the multi-device fan-out one computer can
+  skip the seed while another, switched off during the last upload,
+  still gets it.
+- Only an accepted push is recorded. A rejection or a dropped link
+  leaves the device stale, so the next upload retries.
+- The downloaded payload itself is memoised in-process for the same TTL,
+  so a fan-out to three devices does one HTTP fetch rather than three.
+- The record lives in its own SharedPreferences file and survives
+  unpairing, like the device nickname.
+- `…action.SEND_AGPS` and Settings → *Seed now* ignore the gate
+  entirely: both always fetch and always push, then update the
+  timestamp. That's the escape hatch when a device still won't fix.
+- Look for `agps: skipping <mac> — seeded <n>min ago` in logcat when an
+  upload shows no `agps_bytes=`.

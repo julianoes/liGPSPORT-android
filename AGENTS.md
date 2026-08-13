@@ -32,6 +32,7 @@ Use it as your protocol oracle, not as a runtime dependency.
 │   │   │   ├── AgpsClient.kt       AssistNow Online fetch (UBX-MGA payload)
 │   │   │   ├── LocationInjector.kt FACTORY GPS_COORDINATE_SET (position prior)
 │   │   │   └── UploadPipeline.kt   high-level orchestration (GPX→CNX→AGPS→seed→upload→FILE_USE)
+│   │   ├── data/AgpsSeedStore.kt   per-device "last AGPS seed" record + 2 h freshness gate
 │   │   ├── route/                  GPX parser, CNX encoder, pluggable RouteProvider (brouter / osrm / straightline)
 │   │   ├── search/PhotonClient.kt  type-ahead geocoder
 │   │   ├── ui/
@@ -121,7 +122,7 @@ The harness greps by `req_id=<Y>` (mandatory `--es req_id <id>` or
 | `…action.SET_ROUTER` | inline | `--es id <brouter\|osrm\|straightline>` | `id=` |
 | `…action.LIST_ROUTERS` | inline | — | `count=`, `current=`, per-router `r<N>_id=`, `r<N>_name=`, `r<N>_offline=` |
 | `…action.MOCK_LOCATION` | inline | `--ef lat --ef lon` | `lat=`, `lon=` — sets in-process `MockLocationStore`, consulted by `PLAN_AND_UPLOAD` when no explicit start is given |
-| `…action.SEND_AGPS` | service | — | `agps_bytes=`, `device_status=` — fetches u-blox AssistNow Online and uploads as `file_type=AGPS(7)`. Token is auto-resolved from iGPSport's prod config endpoint (mirrors the official app) when `LIGPSPORT_AGPS_TOKEN` is unset; the env var overrides it when you have your own u-blox AssistNow token. Also piggybacked silently on every `UPLOAD` / `PLAN_AND_UPLOAD` (best-effort: failure doesn't fail the route) — successful piggyback shows `agps_bytes=<N>` on those RESULT lines too. |
+| `…action.SEND_AGPS` | service | — | `agps_bytes=`, `device_status=` — fetches u-blox AssistNow Online and uploads as `file_type=AGPS(7)`. Token is auto-resolved from iGPSport's prod config endpoint (mirrors the official app) when `LIGPSPORT_AGPS_TOKEN` is unset; the env var overrides it when you have your own u-blox AssistNow token. Always forces a fetch+push and records the result in `AgpsSeedStore`. Also piggybacked on `UPLOAD` / `PLAN_AND_UPLOAD` (best-effort: failure doesn't fail the route) — but **only when the target device's last seed is older than `AgpsSeedStore.DEFAULT_TTL_MS` (2 h)**, so a fresh device shows no `agps_bytes=` and logs `agps: skipping <mac> — seeded <n>min ago`. |
 | `…action.SEND_LOCATION` | service | — | `seed_lat=`, `seed_lon=`, `device_status=` — injects the current location as a position prior via the FACTORY `GPS_COORDINATE_SET` op (service=11, op=8). Resolves via `MockLocationStore` → `FusedLocationProviderClient` → `lastLocation`. Also piggybacked silently on every `UPLOAD` / `PLAN_AND_UPLOAD` between the AGPS step and the route upload — successful piggyback shows `seed_lat=` + `seed_lon=` on those RESULT lines. |
 | `…action.LIST_ACTIVITIES` | service | — | `count=`, `a<N>_ts=`, `a<N>_size=` per recorded activity — `CYCLING_DATA LIST_GET` (op=1) on the third UART, gen-4 merged write. PROTOCOL.md §6.4. |
 | `…action.DOWNLOAD_ACTIVITY` | service | `--el timestamp` (long, required) | `timestamp=`, `bytes=`, `saved_path=`, `file_name=`, `device_status=` — `CYCLING_DATA FILE_GET` (op=3) with `file_tag=0x55` (TransmitCompleteCommand). Saves the FIT to `getExternalFilesDir(null)/activities/<UTC-ISO8601>.fit`. |

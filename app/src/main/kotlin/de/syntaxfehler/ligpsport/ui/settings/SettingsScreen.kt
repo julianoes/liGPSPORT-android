@@ -39,6 +39,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -46,9 +47,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.foundation.layout.size
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import de.syntaxfehler.ligpsport.agps.AgpsClient
+import de.syntaxfehler.ligpsport.ble.UploadPipeline
+import de.syntaxfehler.ligpsport.data.AgpsSeedStore
 import de.syntaxfehler.ligpsport.data.AgpsTokenStore
 import de.syntaxfehler.ligpsport.data.MarkerHitboxPreferences
 import androidx.compose.ui.Alignment
@@ -459,6 +463,7 @@ private fun PairedDeviceCard(
                 onClick = onOpenActivities,
                 testTag = "open_device_activities_${device.mac}",
             )
+            AgpsSeedRow(mac = device.mac)
         }
     }
     if (renameOpen) {
@@ -523,6 +528,96 @@ private fun RenameDeviceDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         },
     )
+}
+
+/**
+ * Per-device AGPS seed state plus the manual override.
+ *
+ * Uploads only re-seed when the stored assistance data has expired
+ * ([AgpsSeedStore]), which makes an otherwise invisible decision worth
+ * showing: without it, "why did this upload take 20 s and the next one
+ * 3 s?" has no answer in the UI. "Seed now" forces a fetch and push
+ * regardless of freshness — the escape hatch for a device that still
+ * refuses to get a fix.
+ */
+@Composable
+private fun AgpsSeedRow(mac: String) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val store = remember { AgpsSeedStore(ctx) }
+    var seed by remember(mac) { mutableStateOf(store.get(mac)) }
+    var busy by remember(mac) { mutableStateOf(false) }
+    var status by remember(mac) { mutableStateOf<String?>(null) }
+
+    // Re-tick so "12 minutes ago" doesn't freeze while the screen sits
+    // open; the labels are otherwise only recomposed on state changes.
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(mac) {
+        while (true) {
+            delay(30_000)
+            now = System.currentTimeMillis()
+        }
+    }
+
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("agps_seed_row_$mac"),
+    ) {
+        Row(
+            Modifier.padding(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    "GPS assistance (AGPS)",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    "Last seeded: ${AgpsSeedLabels.lastSeeded(seed?.seededAt, now)} · " +
+                        AgpsSeedLabels.validity(seed?.seededAt, now, store.ttlMs),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.testTag("agps_seed_state_$mac"),
+                )
+                status?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (busy) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            } else {
+                OutlinedButton(
+                    onClick = {
+                        busy = true
+                        status = null
+                        scope.launch {
+                            val res = withContext(Dispatchers.IO) {
+                                UploadPipeline.seedAgps(ctx, targetMac = mac)
+                            }
+                            status = when (res) {
+                                is UploadPipeline.Result.Success ->
+                                    "Seeded ${res.agpsBytes ?: 0} bytes."
+                                is UploadPipeline.Result.Failure -> res.reason
+                            }
+                            seed = store.get(mac)
+                            now = System.currentTimeMillis()
+                            busy = false
+                        }
+                    },
+                    modifier = Modifier.testTag("agps_seed_now_$mac"),
+                ) { Text("Seed now") }
+            }
+        }
+    }
 }
 
 @Composable
