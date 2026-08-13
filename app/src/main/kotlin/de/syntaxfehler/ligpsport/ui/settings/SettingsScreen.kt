@@ -17,7 +17,10 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.BluetoothDisabled
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Route
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.AlertDialog
@@ -57,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.runtime.DisposableEffect
+import de.syntaxfehler.ligpsport.ble.BleSessionManager
 import de.syntaxfehler.ligpsport.ble.DeviceStore
 import de.syntaxfehler.ligpsport.data.RouterPreferences
 import de.syntaxfehler.ligpsport.route.RouteProvider
@@ -69,8 +73,10 @@ fun SettingsScreen(
     onOpenPairing: () -> Unit,
     onOpenRoutes: (mac: String) -> Unit = {},
     onOpenActivities: (mac: String) -> Unit = {},
+    onOpenPreviousRides: () -> Unit = {},
 ) {
     val ctx = LocalContext.current
+    val screenScope = rememberCoroutineScope()
     val routerPrefs = remember { RouterPreferences(ctx) }
     var selected by remember { mutableStateOf(routerPrefs.get()) }
 
@@ -127,6 +133,14 @@ fun SettingsScreen(
                         onForget = {
                             deviceStore.remove(device.mac)
                             paired = deviceStore.list()
+                            // Drop the warm connection too, otherwise the
+                            // session manager keeps the radio open to a
+                            // device the user just told us to forget.
+                            screenScope.launch { BleSessionManager.forget(device.mac) }
+                        },
+                        onRename = { newName ->
+                            deviceStore.setNickname(device.mac, newName)
+                            paired = deviceStore.list()
                         },
                     )
                 }
@@ -150,6 +164,10 @@ fun SettingsScreen(
                     },
                 )
             }
+
+            // --- Previous rides -------------------------------------
+            item { SectionLabel("Previous rides") }
+            item { PreviousRidesRow(onClick = onOpenPreviousRides) }
 
             // --- Map markers ----------------------------------------
             item { MarkerHitboxSection() }
@@ -385,7 +403,9 @@ private fun PairedDeviceCard(
     onOpenRoutes: () -> Unit,
     onOpenActivities: () -> Unit,
     onForget: () -> Unit,
+    onRename: (newName: String?) -> Unit,
 ) {
+    var renameOpen by remember { mutableStateOf(false) }
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -415,10 +435,16 @@ private fun PairedDeviceCard(
                     )
                 }
                 IconButton(
+                    onClick = { renameOpen = true },
+                    modifier = Modifier.testTag("rename_${device.mac}"),
+                ) {
+                    Icon(Icons.Default.Edit, contentDescription = "Rename device")
+                }
+                IconButton(
                     onClick = onForget,
                     modifier = Modifier.testTag("forget_${device.mac}"),
                 ) {
-                    Icon(Icons.Default.BluetoothDisabled, contentDescription = "Forget device")
+                    Icon(Icons.Default.Delete, contentDescription = "Forget device")
                 }
             }
             DeviceSubScreenRow(
@@ -435,6 +461,68 @@ private fun PairedDeviceCard(
             )
         }
     }
+    if (renameOpen) {
+        RenameDeviceDialog(
+            currentName = device.name,
+            macForLabel = device.mac,
+            onDismiss = { renameOpen = false },
+            onConfirm = { newName ->
+                onRename(newName)
+                renameOpen = false
+            },
+        )
+    }
+}
+
+/**
+ * Single-field text dialog for setting a user-defined nickname on a
+ * paired BSC200. Saving a blank value clears the nickname and falls
+ * the displayed label back to the BLE-advertised name.
+ */
+@Composable
+private fun RenameDeviceDialog(
+    currentName: String?,
+    macForLabel: String,
+    onDismiss: () -> Unit,
+    onConfirm: (newName: String?) -> Unit,
+) {
+    var text by remember { mutableStateOf(currentName.orEmpty()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename device") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    macForLabel,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    singleLine = true,
+                    label = { Text("Nickname") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("rename_field_$macForLabel"),
+                )
+                Text(
+                    "Leave empty to restore the device's advertised name.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(text.trim().ifBlank { null }) },
+                modifier = Modifier.testTag("rename_save_$macForLabel"),
+            ) { Text("Save") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 @Composable
@@ -513,6 +601,39 @@ private fun EmptyPairingCard(onPair: () -> Unit) {
                 onClick = onPair,
                 modifier = Modifier.testTag("pair_button"),
             ) { Text("Pair a device") }
+        }
+    }
+}
+
+@Composable
+private fun PreviousRidesRow(onClick: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .clickable(onClick = onClick)
+            .testTag("previous_rides_row"),
+    ) {
+        Row(
+            Modifier.padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Default.Route,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                "Previous rides",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+            )
         }
     }
 }

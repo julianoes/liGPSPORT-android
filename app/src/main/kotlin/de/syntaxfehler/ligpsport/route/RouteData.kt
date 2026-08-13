@@ -44,3 +44,13 @@ internal fun haversine3dM(a: Point, b: Point): Double {
 
 class RouteParseError(message: String, cause: Throwable? = null) :
     IllegalArgumentException(message, cause)
+
+/**
+ * Human-readable kilometre label for a metre distance. Switches
+ * precision around 10 km because a 47.2 km readout is more noise
+ * than signal at that scale — matches the style used in the search
+ * results' formatDistanceLocal.
+ */
+fun formatKm(meters: Double): String =
+    if (meters < 10_000.0) "%.1f km".format(meters / 1_000.0)
+    else "%.0f km".format(meters / 1_000.0)

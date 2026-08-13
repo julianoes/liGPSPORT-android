@@ -53,11 +53,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import de.syntaxfehler.ligpsport.ble.UploadPipeline
 import de.syntaxfehler.ligpsport.data.MarkerHitboxPreferences
+import de.syntaxfehler.ligpsport.data.PreviousRidesStore
 import de.syntaxfehler.ligpsport.data.RouteSessionStore
 import de.syntaxfehler.ligpsport.data.RouterPreferences
 import de.syntaxfehler.ligpsport.route.GpxParser
 import de.syntaxfehler.ligpsport.route.Point
 import de.syntaxfehler.ligpsport.route.RouterRegistry
+import de.syntaxfehler.ligpsport.route.formatKm
+import java.util.UUID
 import de.syntaxfehler.ligpsport.search.PhotonClient
 import de.syntaxfehler.ligpsport.ui.upload.sanitiseFileName
 import kotlinx.coroutines.Dispatchers
@@ -106,11 +109,23 @@ fun MapScreen(
     // Ordered list of intermediate stops between currentLocation and
     // destination. Long-pressing the map drops one; dragging the
     // marker moves it; the auto-plan effect re-routes through them.
-    var intermediates by remember { mutableStateOf<List<Waypoint>>(emptyList()) }
+    var intermediates by remember {
+        mutableStateOf(
+            initialSession?.intermediates.orEmpty().mapIndexed { i, s ->
+                Waypoint(id = System.nanoTime() + i, lat = s.lat, lon = s.lon, label = s.label)
+            },
+        )
+    }
     // User-edited start point. null = follow the live GPS / mock fix.
     // Set by dragging the Start marker on the map; takes precedence
     // over `currentLocation` in the auto-plan effect.
-    var startOverride by remember { mutableStateOf<Point?>(null) }
+    var startOverride by remember {
+        mutableStateOf(
+            initialSession?.let { s ->
+                if (s.startLat != null && s.startLon != null) Point(s.startLat, s.startLon) else null
+            },
+        )
+    }
     // Marker hit-area size. Settings-controlled (in dp); recomposes
     // markers whenever the value changes. Re-read on every resume so
     // a tweak in Settings → Map markers takes effect on next return.
@@ -142,7 +157,29 @@ fun MapScreen(
     // Sticky display label for the Start row. Defaults to "Your
     // location"; replaced when the user picks a custom origin via
     // either dragging the start marker or searching the Start row.
-    var startLabel by remember { mutableStateOf("Your location") }
+    var startLabel by remember { mutableStateOf(initialSession?.startLabel ?: "Your location") }
+    // Signature of the *restored* route (destination + vias + start).
+    // While the live snapshot still matches, [AutoPlanEffect] skips
+    // a re-plan — otherwise opening a previous ride from history would
+    // immediately overwrite the saved polyline with a freshly-computed
+    // one. The signature is cleared the moment the user edits any
+    // stop, so subsequent edits replan as normal.
+    var suppressPlanSignature by remember {
+        mutableStateOf(
+            initialSession?.plannedGpx?.let {
+                routeSignature(
+                    destination = destination,
+                    intermediates = intermediates,
+                    startOverride = startOverride,
+                )
+            },
+        )
+    }
+    // Tracks the last RouteSessionStore session we've replayed into
+    // local state. Used by the ON_RESUME observer to detect a fresh
+    // restore (e.g. picked from the Previous Rides screen) without
+    // re-applying our own outbound writes.
+    var lastAppliedSession by remember { mutableStateOf(initialSession) }
     // Drag-end handler for the destination marker. Updates coords but
     // keeps the existing label (a drag isn't a "pick a new place"
     // gesture) and keeps the intermediates list intact (the user is
@@ -232,30 +269,102 @@ fun MapScreen(
         }
     }
 
-    // Persist destination edits so they survive a Map → Upload → Back
-    // round-trip. Setting destination=null clears the store entirely
-    // (the user pressed the "X" on the card). When the destination
-    // changes, the old plan no longer applies — drop it so the Upload
-    // button stays disabled until the user re-plans.
-    LaunchedEffect(destination) {
+    // Mirror the full editor state — destination, vias, start
+    // override, start label — into [RouteSessionStore] so a round-
+    // trip through Settings (where `remember` blocks blow away) or
+    // a navigate-back from "Previous rides" keeps every stop.
+    //
+    // When the destination itself changes (vs. the previously-stored
+    // one) the polyline is invalidated — the old route no longer
+    // applies — so the Upload button reverts to disabled until the
+    // auto-plan computes a fresh one.
+    LaunchedEffect(destination, intermediates, startOverride, startLabel) {
         val d = destination
         if (d == null) {
             RouteSessionStore.clear()
             plannedGpx = null
-        } else {
-            val cur = RouteSessionStore.get()
-            if (cur == null ||
-                cur.destinationLat != d.lat ||
-                cur.destinationLon != d.lon ||
-                cur.destinationName != d.label
-            ) {
-                RouteSessionStore.set(
-                    RouteSessionStore.Session(d.label, d.lat, d.lon, plannedGpx = null),
-                )
-                plannedGpx = null
-                clearRouteOverlay(mapView)
-            }
+            lastAppliedSession = null
+            return@LaunchedEffect
         }
+        val cur = RouteSessionStore.get()
+        val destChanged = cur == null ||
+            cur.destinationLat != d.lat ||
+            cur.destinationLon != d.lon ||
+            cur.destinationName != d.label
+        val vias = intermediates.map { RouteSessionStore.Stop(it.lat, it.lon, it.label) }
+        val next = RouteSessionStore.Session(
+            destinationName = d.label,
+            destinationLat = d.lat,
+            destinationLon = d.lon,
+            plannedGpx = if (destChanged) null else cur?.plannedGpx,
+            intermediates = vias,
+            startLat = startOverride?.latitude,
+            startLon = startOverride?.longitude,
+            startLabel = startLabel,
+        )
+        RouteSessionStore.set(next)
+        lastAppliedSession = next
+        if (destChanged) {
+            plannedGpx = null
+            clearRouteOverlay(mapView)
+        }
+        // If anything changed away from the suppressed signature,
+        // drop the gate so the next AutoPlanEffect tick computes a
+        // fresh route. The signature uses 6-decimal coordinate keys
+        // — drag jitter under ~10 cm doesn't accidentally re-plan,
+        // a real stop add/move does.
+        val sigNow = routeSignature(destination, intermediates, startOverride)
+        if (suppressPlanSignature != null && suppressPlanSignature != sigNow) {
+            suppressPlanSignature = null
+        }
+    }
+
+    // Watch [RouteSessionStore] across resumes so an external writer
+    // (the Previous Rides screen) can drop a fully-formed session in
+    // and have MapScreen reflect it without re-creating the activity.
+    DisposableEffect(lifecycle, mapView) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event != androidx.lifecycle.Lifecycle.Event.ON_RESUME) return@LifecycleEventObserver
+            val cur = RouteSessionStore.get() ?: return@LifecycleEventObserver
+            if (cur == lastAppliedSession) return@LifecycleEventObserver
+            // Replay onto the live editor + the MapView. Set the
+            // mutable states first; the LaunchedEffects keyed on
+            // them will refresh their own visuals (start marker,
+            // intermediate markers). Polyline + destination marker +
+            // camera need an explicit nudge here — they're driven
+            // off LaunchedEffect(mapView) which doesn't re-fire on
+            // resume.
+            val dest = Destination(cur.destinationName, cur.destinationLat, cur.destinationLon)
+            destination = dest
+            val tBase = System.nanoTime()
+            intermediates = cur.intermediates.mapIndexed { i, s ->
+                Waypoint(
+                    id = tBase + i,
+                    lat = s.lat,
+                    lon = s.lon,
+                    label = s.label,
+                )
+            }
+            startOverride = if (cur.startLat != null && cur.startLon != null) {
+                Point(cur.startLat, cur.startLon)
+            } else {
+                null
+            }
+            startLabel = cur.startLabel ?: "Your location"
+            plannedGpx = cur.plannedGpx
+            suppressPlanSignature = cur.plannedGpx?.let {
+                routeSignature(dest, intermediates, startOverride)
+            }
+            lastAppliedSession = cur
+
+            setDestination(mapView, null, dest, hitboxSizeDp, onDestDragEnd)
+            clearRouteOverlay(mapView)
+            cur.plannedGpx?.let { drawRoute(mapView, it) }
+            mapView.controller.animateTo(GeoPoint(dest.lat, dest.lon))
+            uploadState = UploadButtonState.Idle
+        }
+        lifecycle.addObserver(obs)
+        onDispose { lifecycle.removeObserver(obs) }
     }
 
     // Any edit to the planned route — destination, vias, or an explicit
@@ -269,6 +378,44 @@ fun MapScreen(
         uploadState = uploadState,
         onReset = { uploadState = UploadButtonState.Idle },
     )
+
+    // Auto-name vias that don't already carry a Photon label —
+    // i.e. those added by long-pressing the map (the inline geocode
+    // there can race or fail) and those whose label was cleared by a
+    // marker drag. The brief asked vias to read their nearest place
+    // name, same as start / destination, instead of "Stop N".
+    //
+    // Tracked per-id so a drag of via A doesn't fire a duplicate
+    // Photon call for via B that's still in flight. Stale ids
+    // (vias that were removed) are pruned each tick.
+    val viaGeocodes = remember { androidx.compose.runtime.mutableStateMapOf<Long, Pair<Double, Double>>() }
+    LaunchedEffect(intermediates) {
+        viaGeocodes.keys.toList().forEach { id ->
+            if (intermediates.none { it.id == id }) viaGeocodes.remove(id)
+        }
+        intermediates.forEach { via ->
+            if (via.label != null) return@forEach
+            val key = via.lat to via.lon
+            if (viaGeocodes[via.id] == key) return@forEach
+            viaGeocodes[via.id] = key
+            scope.launch {
+                val named = try {
+                    withContext(Dispatchers.IO) { PhotonClient().reverse(via.lat, via.lon) }
+                } catch (_: Exception) { null } ?: return@launch
+                intermediates = intermediates.map { existing ->
+                    if (existing.id == via.id &&
+                        existing.lat == via.lat &&
+                        existing.lon == via.lon &&
+                        existing.label == null
+                    ) {
+                        existing.copy(label = named.name)
+                    } else {
+                        existing
+                    }
+                }
+            }
+        }
+    }
 
     // Permission grant flips us from "overlay constructed but not
     // listening" to "overlay actively requesting fixes" without
@@ -469,6 +616,29 @@ fun MapScreen(
                         label = result.name,
                     )
                 },
+                onSwapStartAndDestination = onSwap@{
+                    val dest = destination ?: return@onSwap
+                    val effectiveStart = startOverride ?: currentLocation
+                    if (effectiveStart == null) {
+                        statusMessage = "Waiting for GPS fix to swap…"
+                        return@onSwap
+                    }
+                    val oldStartLabel = startLabel
+                    // Destination becomes the start; the old start
+                    // (live fix or override) becomes the destination.
+                    // Vias reverse so the new geometry doesn't double
+                    // back — matches Google Maps' swap-arrows behaviour.
+                    val newDest = Destination(
+                        label = oldStartLabel,
+                        lat = effectiveStart.latitude,
+                        lon = effectiveStart.longitude,
+                    )
+                    destination = setDestination(mapView, dest, newDest, hitboxSizeDp, onDestDragEnd)
+                    startOverride = Point(dest.lat, dest.lon)
+                    startLabel = dest.label
+                    intermediates = intermediates.reversed()
+                    mapView.controller.animateTo(GeoPoint(newDest.lat, newDest.lon))
+                },
             )
 
             statusMessage?.let { msg ->
@@ -550,6 +720,7 @@ fun MapScreen(
             intermediates = intermediates,
             startOverride = startOverride,
             currentLocation = currentLocation,
+            suppressSignature = suppressPlanSignature,
             onNoFix = { statusMessage = "Waiting for GPS fix…" },
             onPlan = onPlan@{ start, dest, via ->
                 val provider = RouterRegistry.byId(RouterPreferences(ctx).get())
@@ -621,10 +792,19 @@ fun MapScreen(
         // Bottom card appears as soon as a destination is set.
         destination?.let { dest ->
             val uploading = uploadState is UploadButtonState.Uploading
+            // Parse the GPX once per byte-array identity to extract the
+            // total distance — cheap, but a recomposition every 2 s
+            // (currentLocation refresh) would still add up.
+            val routeKm = remember(plannedGpx) {
+                plannedGpx?.let { bytes ->
+                    runCatching { GpxParser.parse(bytes).distanceM }.getOrNull()
+                }
+            }
             DestinationCard(
                 destination = dest,
                 planning = planningRoute,
                 hasPlan = plannedGpx != null,
+                distanceM = routeKm,
                 uploadState = uploadState,
                 // Block the X button while the upload is in flight —
                 // clearing the destination during upload would tear
@@ -657,14 +837,15 @@ fun MapScreen(
                     val uploadedStart = startOverride
                     uploadState = UploadButtonState.Uploading
                     scope.launch {
-                        // Fan out to every paired device. The pipeline
-                        // opens a separate GATT connection per MAC,
-                        // serialises uploads inside each transport's
-                        // mutex, and returns a MAC-keyed map so we can
-                        // distinguish "all good" from "device 3 was
-                        // off". Single-device users see exactly the
-                        // same behaviour as before — the map has one
-                        // entry, which collapses cleanly into the
+                        // Fan out to every paired device. BleSessionManager
+                        // holds one shared connection per MAC and leases it
+                        // exclusively, so the upload can't collide with the
+                        // nav-status poll running against the same computer;
+                        // different MACs still upload in parallel. The
+                        // MAC-keyed map lets us distinguish "all good" from
+                        // "device 3 was off". Single-device users see
+                        // exactly the same behaviour as before — the map has
+                        // one entry, which collapses cleanly into the
                         // existing Success / Failed states.
                         val results = withContext(Dispatchers.IO) {
                             UploadPipeline.uploadGpxAll(ctx, gpx, fileName = fileName)
@@ -681,20 +862,29 @@ fun MapScreen(
                             UploadButtonState.Failed("no paired device")
                         } else {
                             val successes = results.count { it.value is UploadPipeline.Result.Success }
-                            val failures = results
-                                .filterValues { it is UploadPipeline.Result.Failure }
-                                .mapValues { (it.value as UploadPipeline.Result.Failure).reason }
+                            // Connect-level retries already happened inside
+                            // BleSessionManager. If at least one device
+                            // acked, surface a clean Success —
+                            // suppress the partial-fail breakdown that
+                            // pestered users when the second computer was
+                            // legitimately switched off.
                             when {
-                                failures.isEmpty() -> UploadButtonState.Success
-                                successes == 0 -> UploadButtonState.Failed(
-                                    failures.values.first(),
-                                )
-                                else -> UploadButtonState.Failed(
-                                    "$successes/${results.size} OK — " +
-                                        failures.entries.joinToString("; ") { (mac, why) ->
-                                            "${mac.takeLast(5)}: $why"
-                                        },
-                                )
+                                successes > 0 -> {
+                                    saveCurrentRide(
+                                        context = ctx,
+                                        destination = dest,
+                                        startLabel = startLabel,
+                                        startOverride = uploadedStart,
+                                        vias = uploadedVias,
+                                        gpx = gpx,
+                                        fileName = fileName,
+                                    )
+                                    UploadButtonState.Success(
+                                        successes = successes,
+                                        total = results.size,
+                                    )
+                                }
+                                else -> UploadButtonState.Failed("upload failed")
                             }
                         }
                     }
@@ -760,7 +950,10 @@ internal fun BottomEndFabs(
 internal sealed interface UploadButtonState {
     data object Idle : UploadButtonState
     data object Uploading : UploadButtonState
-    data object Success : UploadButtonState
+    /** [successes] devices acked out of [total] attempted. Surfaced
+     *  as "Uploaded (N/M)" so a partial result (e.g. 1 of 2 paired
+     *  devices was off) is visible without nagging error text. */
+    data class Success(val successes: Int, val total: Int) : UploadButtonState
     data class Failed(val reason: String) : UploadButtonState
 }
 
@@ -769,6 +962,7 @@ private fun DestinationCard(
     destination: Destination,
     planning: Boolean,
     hasPlan: Boolean,
+    distanceM: Double?,
     uploadState: UploadButtonState,
     onClear: (() -> Unit)?,
     onUpload: () -> Unit,
@@ -795,10 +989,13 @@ private fun DestinationCard(
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                     )
+                    val coordsLine = "%.5f, %.5f".format(destination.lat, destination.lon)
+                    val combined = distanceM?.let { "$coordsLine  ·  ${formatKm(it)}" } ?: coordsLine
                     Text(
-                        "%.5f, %.5f".format(destination.lat, destination.lon),
+                        combined,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.testTag("destination_subtitle"),
                     )
                 }
                 if (onClear != null) {
@@ -840,7 +1037,7 @@ private fun UploadButton(
 
     val (label, leading, containerColor, contentColor, enabled, click) = when {
         state is UploadButtonState.Success -> ButtonView(
-            label = "Uploaded",
+            label = "Uploaded (${state.successes}/${state.total})",
             leading = ButtonLeading.Icon(Icons.Default.CheckCircle),
             containerColor = ok,
             contentColor = onOk,
@@ -951,17 +1148,84 @@ internal fun AutoPlanEffect(
     currentLocation: Point?,
     onPlan: suspend (start: Point, dest: Destination, vias: List<Point>) -> Unit,
     onNoFix: () -> Unit = {},
+    /** When the live (destination, vias, start) snapshot equals this
+     *  signature, suppress re-planning. Used after restoring a saved
+     *  ride from history so the user sees the *saved* polyline, not a
+     *  freshly-computed (and possibly subtly different) one. Any edit
+     *  changes the signature → suppression lifts → plan as normal. */
+    suppressSignature: String? = null,
 ) {
     val hasInitialFix = currentLocation != null
-    LaunchedEffect(destination, intermediates, startOverride, hasInitialFix) {
+    LaunchedEffect(destination, intermediates, startOverride, hasInitialFix, suppressSignature) {
         val dest = destination ?: return@LaunchedEffect
         val start = startOverride ?: currentLocation
         if (start == null) {
             onNoFix()
             return@LaunchedEffect
         }
+        if (suppressSignature != null &&
+            suppressSignature == routeSignature(destination, intermediates, startOverride)
+        ) {
+            return@LaunchedEffect
+        }
         onPlan(start, dest, intermediates.map { Point(it.lat, it.lon) })
     }
+}
+
+/**
+ * Persist a successfully-uploaded ride into [PreviousRidesStore].
+ * Called whenever the fan-out upload reports at least one device
+ * acked — see the "any device acked" save criterion. Distance comes
+ * from a fresh GPX parse rather than the live [RouteData] cache
+ * because the cache lives in the planner and isn't surfaced here.
+ */
+private fun saveCurrentRide(
+    context: android.content.Context,
+    destination: Destination,
+    startLabel: String,
+    startOverride: Point?,
+    vias: List<Waypoint>,
+    gpx: ByteArray,
+    fileName: String,
+) {
+    val distance = runCatching { GpxParser.parse(gpx).distanceM }.getOrDefault(0.0)
+    PreviousRidesStore(context).add(
+        PreviousRidesStore.Ride(
+            id = UUID.randomUUID().toString(),
+            savedAt = System.currentTimeMillis(),
+            destinationLabel = destination.label,
+            destinationLat = destination.lat,
+            destinationLon = destination.lon,
+            startLabel = startLabel,
+            startLat = startOverride?.latitude,
+            startLon = startOverride?.longitude,
+            intermediates = vias.map {
+                PreviousRidesStore.SavedWaypoint(it.lat, it.lon, it.label)
+            },
+            routerId = RouterPreferences(context).get(),
+            fileName = fileName,
+            gpxBase64 = PreviousRidesStore.encodeGpx(gpx),
+            distanceM = distance,
+        ),
+    )
+}
+
+/**
+ * Stable hash of the route's editable inputs. Used to decide whether
+ * the current snapshot still matches a restored ride (in which case
+ * we leave the saved polyline alone) or has drifted because the user
+ * edited a stop. 6-decimal precision matches Photon coordinates so
+ * marker drag-jitter under ~10 cm doesn't flip the signature.
+ */
+internal fun routeSignature(
+    destination: Destination?,
+    intermediates: List<Waypoint>,
+    startOverride: Point?,
+): String {
+    val d = destination?.let { "%.6f,%.6f".format(it.lat, it.lon) } ?: "null"
+    val v = intermediates.joinToString("|") { "%.6f,%.6f".format(it.lat, it.lon) }
+    val s = startOverride?.let { "%.6f,%.6f".format(it.latitude, it.longitude) } ?: "live"
+    return "$d#$v#$s"
 }
 
 /**

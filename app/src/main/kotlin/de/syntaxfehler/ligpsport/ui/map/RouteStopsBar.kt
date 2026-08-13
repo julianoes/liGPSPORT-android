@@ -1,8 +1,11 @@
 package de.syntaxfehler.ligpsport.ui.map
 
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,10 +25,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -47,6 +50,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -111,6 +116,7 @@ internal fun RouteStopsBar(
     onViaRemove: (id: Long) -> Unit,
     onViaReorder: (from: Int, to: Int) -> Unit,
     onAddStop: (SearchResult) -> Unit,
+    onSwapStartAndDestination: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var editing by remember { mutableStateOf<EditTarget?>(null) }
@@ -212,6 +218,7 @@ internal fun RouteStopsBar(
                     onActivate = { editing = EditTarget.Start },
                     onDismiss = { editing = null },
                     onClear = onStartClear,
+                    onSwap = onSwapStartAndDestination,
                 )
 
                 if (intermediates.isNotEmpty()) {
@@ -310,6 +317,7 @@ private fun StartRow(
     onActivate: () -> Unit,
     onDismiss: () -> Unit,
     onClear: () -> Unit,
+    onSwap: () -> Unit,
 ) {
     if (editing) {
         InlineSearchField(
@@ -326,16 +334,31 @@ private fun StartRow(
             label = label,
             testTag = "stop_row_start",
             onClick = onActivate,
-            trailing = if (isOverride) {
-                {
+            trailing = {
+                // Two trailing actions on the Start row: optional
+                // "clear override" (only when the user explicitly
+                // picked a start) and the always-on Swap that
+                // exchanges Start ↔ Destination and reverses vias.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (isOverride) {
+                        IconButton(
+                            onClick = onClear,
+                            modifier = Modifier.testTag("stop_row_start_clear"),
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = "Use my location")
+                        }
+                    }
                     IconButton(
-                        onClick = onClear,
-                        modifier = Modifier.testTag("stop_row_start_clear"),
+                        onClick = onSwap,
+                        modifier = Modifier.testTag("stop_row_swap"),
                     ) {
-                        Icon(Icons.Default.Close, contentDescription = "Use my location")
+                        Icon(
+                            Icons.Default.SwapVert,
+                            contentDescription = "Swap start and destination",
+                        )
                     }
                 }
-            } else null,
+            },
         )
     }
 }
@@ -420,13 +443,16 @@ private fun AddStopRow(
 // ---------------------------------------------------------------------
 
 /**
- * Renders the via list with drag-to-reorder handles. The drag
- * mechanic is a simple cumulative vertical delta: once the user's
- * finger has moved more than half a row height in either direction,
- * the dragged via swaps with its neighbour and the accumulator
- * resets. Recomposition re-anchors the handle under the finger so
- * a continuous drag walks the via through the list one slot at a
- * time. Good enough for a list that's almost always under 5 items.
+ * Renders the via list with long-press-to-reorder. There's no
+ * dedicated drag handle — the user long-presses anywhere on the row
+ * to "pick it up", and the row visually lifts (scale + shadow) so
+ * the gesture is unmistakable. A subsequent vertical drag walks the
+ * via through the list one slot at a time using the same accumulator
+ * trick as before: once the finger has moved more than half a row
+ * height in either direction, the dragged via swaps with its
+ * neighbour and the accumulator resets. This matches the Android
+ * Settings reorder pattern and removes the two-icon clutter the
+ * dedicated handle introduced alongside [ViaIcon].
  */
 @Composable
 private fun ReorderableVias(
@@ -446,7 +472,7 @@ private fun ReorderableVias(
     var draggingId by remember { mutableStateOf<Long?>(null) }
 
     Column {
-        vias.forEachIndexed { index, via ->
+        vias.forEach { via ->
             val isEditing = via.id == editingId
             if (isEditing) {
                 InlineSearchField(
@@ -458,53 +484,77 @@ private fun ReorderableVias(
                     testTag = "stop_row_via_input_${via.id}",
                 )
             } else {
+                val dragging = draggingId == via.id
+                // Spring the scale up/down so the lift feels physical
+                // — Material 3's standard spring is plenty bouncy
+                // without overshooting noticeably on the down-swing.
+                val scale by animateFloatAsState(
+                    targetValue = if (dragging) 1.04f else 1f,
+                    animationSpec = spring(),
+                    label = "via-scale",
+                )
+                val elevation by animateDpAsState(
+                    targetValue = if (dragging) 8.dp else 0.dp,
+                    animationSpec = spring(),
+                    label = "via-elevation",
+                )
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = rowHeightDp)
-                        .padding(horizontal = 4.dp, vertical = 6.dp)
+                        .graphicsLayer {
+                            scaleX = scale
+                            scaleY = scale
+                        }
+                        .shadow(elevation, shape = RoundedCornerShape(12.dp))
+                        .background(
+                            color = if (dragging) {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.surface
+                            },
+                            shape = RoundedCornerShape(12.dp),
+                        )
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .pointerInput(via.id, vias.size) {
+                            // Long-press anywhere on the row picks it
+                            // up; subsequent vertical drag walks it
+                            // through the list. Tap (without
+                            // long-press) is still handled by the
+                            // editable label's clickable below.
+                            detectDragGesturesAfterLongPress(
+                                onDragStart = {
+                                    draggingId = via.id
+                                    accumulator = 0f
+                                },
+                                onDragEnd = {
+                                    draggingId = null
+                                    accumulator = 0f
+                                },
+                                onDragCancel = {
+                                    draggingId = null
+                                    accumulator = 0f
+                                },
+                                onDrag = onDrag@{ _, delta ->
+                                    if (draggingId != via.id) return@onDrag
+                                    accumulator += delta.y
+                                    val currentIndex = vias.indexOfFirst { it.id == via.id }
+                                    if (currentIndex < 0) return@onDrag
+                                    if (accumulator >= swapThresholdPx && currentIndex < vias.lastIndex) {
+                                        onReorder(currentIndex, currentIndex + 1)
+                                        accumulator -= swapThresholdPx * 2
+                                    } else if (accumulator <= -swapThresholdPx && currentIndex > 0) {
+                                        onReorder(currentIndex, currentIndex - 1)
+                                        accumulator += swapThresholdPx * 2
+                                    }
+                                },
+                            )
+                        }
                         .testTag("stop_row_via_${via.id}"),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Icon(
-                        Icons.Default.DragHandle,
-                        contentDescription = "Reorder stop",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier
-                            .size(24.dp)
-                            .testTag("stop_row_via_handle_${via.id}")
-                            .pointerInput(via.id, vias.size) {
-                                detectVerticalDragGestures(
-                                    onDragStart = {
-                                        draggingId = via.id
-                                        accumulator = 0f
-                                    },
-                                    onDragEnd = {
-                                        draggingId = null
-                                        accumulator = 0f
-                                    },
-                                    onDragCancel = {
-                                        draggingId = null
-                                        accumulator = 0f
-                                    },
-                                    onVerticalDrag = onDrag@{ _, dy ->
-                                        if (draggingId != via.id) return@onDrag
-                                        accumulator += dy
-                                        val currentIndex = vias.indexOfFirst { it.id == via.id }
-                                        if (currentIndex < 0) return@onDrag
-                                        if (accumulator >= swapThresholdPx && currentIndex < vias.lastIndex) {
-                                            onReorder(currentIndex, currentIndex + 1)
-                                            accumulator -= swapThresholdPx * 2
-                                        } else if (accumulator <= -swapThresholdPx && currentIndex > 0) {
-                                            onReorder(currentIndex, currentIndex - 1)
-                                            accumulator += swapThresholdPx * 2
-                                        }
-                                    },
-                                )
-                            },
-                    )
-                    ViaIcon(index = index + 1)
+                    ViaIcon()
                     Column(
                         modifier = Modifier
                             .weight(1f)
@@ -512,7 +562,16 @@ private fun ReorderableVias(
                             .padding(vertical = 4.dp),
                     ) {
                         Text(
-                            via.label ?: "Stop ${index + 1}",
+                            // Vias auto-reverse-geocode like start /
+                            // destination — see MapScreen's
+                            // viaGeocodes effect. The transient
+                            // "Locating…" only flashes for ~200 ms
+                            // after a tap-add or marker drag; if
+                            // Photon ultimately errors the row stays
+                            // on this label, and the subtitle's
+                            // coordinates still tell the user what
+                            // they picked.
+                            via.label ?: "Locating…",
                             style = MaterialTheme.typography.bodyLarge,
                             fontWeight = FontWeight.Medium,
                         )
@@ -703,19 +762,30 @@ private fun StartIcon() {
 }
 
 @Composable
-private fun ViaIcon(index: Int) {
+private fun ViaIcon() {
+    // Bare two-bar "=" glyph, sized + coloured to match the other
+    // leading icons in the bar: 24 dp bounding box (same as the
+    // Material Add / LocationOn icons), primary tint (same as the
+    // destination pin), centred geometrically. The earlier filled
+    // tertiary-colour circle made the via row read as a different
+    // kind of element from start / add / destination — see
+    // icon_issue.png — when all four are conceptually peers in the
+    // same column.
     Box(
-        modifier = Modifier
-            .size(24.dp)
-            .clip(CircleShape)
-            .background(MaterialTheme.colorScheme.tertiary),
+        modifier = Modifier.size(24.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(
-            "$index",
-            color = MaterialTheme.colorScheme.onTertiary,
-            style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.Bold,
-        )
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Box(
+                Modifier
+                    .size(width = 16.dp, height = 2.5.dp)
+                    .background(MaterialTheme.colorScheme.primary),
+            )
+            Box(
+                Modifier
+                    .size(width = 16.dp, height = 2.5.dp)
+                    .background(MaterialTheme.colorScheme.primary),
+            )
+        }
     }
 }

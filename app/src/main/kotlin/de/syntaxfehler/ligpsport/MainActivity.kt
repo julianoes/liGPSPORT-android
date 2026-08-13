@@ -17,6 +17,7 @@ import de.syntaxfehler.ligpsport.ui.map.MapScreen
 import de.syntaxfehler.ligpsport.ui.pairing.PairingScreen
 import de.syntaxfehler.ligpsport.ui.settings.DeviceActivitiesScreen
 import de.syntaxfehler.ligpsport.ui.settings.DeviceRoutesScreen
+import de.syntaxfehler.ligpsport.ui.settings.PreviousRidesScreen
 import de.syntaxfehler.ligpsport.ui.settings.SettingsScreen
 import de.syntaxfehler.ligpsport.ui.theme.LigpsportTheme
 
@@ -54,6 +55,16 @@ private fun AppNav() {
                 onOpenPairing = { nav.navigate("pairing") },
                 onOpenRoutes = { mac -> nav.navigate("settings/routes/$mac") },
                 onOpenActivities = { mac -> nav.navigate("settings/activities/$mac") },
+                onOpenPreviousRides = { nav.navigate("previous_rides") },
+            )
+        }
+        composable("previous_rides") {
+            PreviousRidesScreen(
+                onBack = { nav.popBackStack() },
+                // Pop the entire settings stack so the user lands
+                // back on the map with the restored ride already in
+                // place — RouteSessionStore was filled in onOpen.
+                onRestoredToMap = { nav.popBackStack(route = "map", inclusive = false) },
             )
         }
         composable(
