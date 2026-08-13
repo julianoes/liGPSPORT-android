@@ -35,6 +35,10 @@ reliable again.
   them so the new geometry doesn't double back.
 - **Rename a paired device** from Settings. Nicknames survive
   unpairing and re-pairing.
+- **Share recorded activities.** The activity list gains a share
+  button that downloads the FIT file from the device and hands it to
+  Android's share sheet, exposed through a new FileProvider.
+  (@mbeutelspacher, #2)
 - **Per-device sub-menus in Settings.** "Paired devices (n / 10)" is
   the top section now; each device row has its own "Routes on
   device" and "Activities on device" launchers plus a forget button.
@@ -67,6 +71,10 @@ reliable again.
   reported as a BLE failure.
 - The AGPS download and the GPS fix are resolved before the device
   link is taken instead of during it.
+- **Sharing a GPX into the app actually uploads it.** The import
+  screen parsed and previewed the file but had no way to send it; it
+  now has an Upload button wired to the pipeline, with in-place
+  progress and error states. (@mbeutelspacher, #1)
 - **Scan results keep the device name after unpairing.** The last
   known label per MAC is persisted separately from the pairing slot,
   and the scanner now reads the advertisement's local name rather
