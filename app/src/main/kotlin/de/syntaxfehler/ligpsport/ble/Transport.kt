@@ -23,6 +23,15 @@ interface Transport {
     suspend fun close()
 }
 
+/**
+ * A [Transport] whose liveness can be interrogated. [BleSessionManager]
+ * caches one of these per device and needs to tell a still-usable link
+ * from one the stack dropped while the app sat idle.
+ */
+interface ManagedTransport : Transport {
+    fun isConnected(): Boolean
+}
+
 data class ReceivedFrame(val channel: Channel, val bytes: ByteArray) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

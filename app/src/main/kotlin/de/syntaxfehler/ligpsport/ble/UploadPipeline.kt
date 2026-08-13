@@ -27,6 +27,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.cancellation.CancellationException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -36,8 +37,13 @@ import kotlin.coroutines.resume
 /**
  * High-level orchestration: GPX → CNX → BLE upload, plus the
  * complementary primitives (pair / delete / plan / list) used by both
- * the in-app UI and the adb broadcast harness. Each helper opens a
- * fresh [BleTransport] so callers don't need to manage GATT lifetime.
+ * the in-app UI and the adb broadcast harness.
+ *
+ * Every helper borrows its device link from [BleSessionManager] via
+ * [withDevice], so callers don't need to manage GATT lifetime and — more
+ * importantly — two helpers can never hold overlapping connections to the
+ * same computer. See the class docs on [BleSessionManager] for why that
+ * used to break uploads.
  */
 object UploadPipeline {
     private const val TAG = "UploadPipeline"
@@ -98,11 +104,14 @@ object UploadPipeline {
         val adapter = bluetoothAdapter(context) ?: return Result.Failure("Bluetooth not available")
         if (!adapter.isEnabled) return Result.Failure("Bluetooth is off — enable it and retry")
         val scanner = DeviceScanner(adapter)
-        val device = withTimeoutOrNull(timeoutMs) { scanner.scan().firstOrNull() }
+        val hit = withTimeoutOrNull(timeoutMs) { scanner.scan().firstOrNull() }
             ?: return Result.Failure("no iGPSPORT device found within ${timeoutMs}ms")
-        val name = try { device.name } catch (_: SecurityException) { null }
-        DeviceStore(context).save(name = name, address = device.address)
-        return Result.Success(deviceName = name, deviceMac = device.address)
+        // save() replaces every pairing, so drop the cached links of the
+        // devices it just dropped instead of holding their radios open
+        // until the idle reaper fires.
+        BleSessionManager.forgetAll()
+        DeviceStore(context).save(name = hit.name, address = hit.address)
+        return Result.Success(deviceName = hit.name, deviceMac = hit.address)
     }
 
     // ---- Plan + upload -----------------------------------------------
@@ -153,14 +162,11 @@ object UploadPipeline {
         fileName: String = "route",
         targetMac: String? = null,
     ): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, pairedName, pairedMac) = transportSetup
+        val paired = resolvePaired(context, targetMac) ?: return Result.Failure("no paired device")
 
         val route: RouteData = try {
             GpxParser.parse(gpxBytes)
         } catch (e: Exception) {
-            transport.runCatching { close() }
             return Result.Failure("GPX parse failed: ${e.message}")
         }
         Log.i(TAG, "upload: parsed ${route.points.size} GPX points")
@@ -168,28 +174,31 @@ object UploadPipeline {
         val cnx: ByteArray = try {
             CnxEncoder.encode(route, routeId = fileId)
         } catch (e: Exception) {
-            transport.runCatching { close() }
             return Result.Failure("CNX encode failed: ${e.message}")
         }
         Log.i(TAG, "upload: cnx encode ${cnx.size}B in ${System.currentTimeMillis() - tEnc}ms")
 
-        return try {
-            val tBle = System.currentTimeMillis()
-            transport.open()
-            Log.i(TAG, "upload: ble open in ${System.currentTimeMillis() - tBle}ms")
+        // Resolve the off-device inputs *before* taking the device lease.
+        // Both an AssistNow HTTP round-trip and a high-accuracy GPS fix
+        // can take several seconds, and holding the device's exclusive
+        // lease for them would stall the nav-status poll (and, when
+        // fanning out, nothing else — the lease is per MAC) for no reason.
+        val agpsData = fetchAgpsOrNull(context)
+        val fix = resolveCurrentLocation(context)
 
+        return withDevice(context, paired) { transport, _ ->
             // Piggyback AGPS seed before the route so the device gets
             // assistance data while the user is still putting the bike
             // away. Best-effort: a fetch failure doesn't fail the
             // route upload — we just log it and proceed.
-            val agpsBytes = uploadAgpsBestEffort(context, transport)
+            val agpsBytes = agpsData?.let { pushAgpsBestEffort(transport, it) }
 
             // Inject the phone's current location as a starting-point
             // prior. AGPS supplies "which satellite is where in orbit";
             // SET_COORDINATE supplies "the receiver is right here" —
             // together they hot-start the BSC200's GNSS chip. Best-
             // effort, same as AGPS.
-            val seedFix = injectCurrentLocationBestEffort(context, transport)
+            val seedFix = fix?.let { pushLocationBestEffort(transport, it) }
 
             Log.i(TAG, "upload: sending route…")
             val r = FileTransfer.uploadGeneralFile(
@@ -226,8 +235,8 @@ object UploadPipeline {
                 Result.Success(
                     status = r.status,
                     bytesSent = cnx.size,
-                    deviceName = pairedName,
-                    deviceMac = pairedMac,
+                    deviceName = paired.name,
+                    deviceMac = paired.mac,
                     fileId = fileId,
                     points = route.points.size,
                     agpsBytes = agpsBytes,
@@ -238,10 +247,6 @@ object UploadPipeline {
             } else {
                 Result.Failure(r.message, r.status)
             }
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
         }
     }
 
@@ -256,16 +261,12 @@ object UploadPipeline {
     suspend fun sendCurrentLocation(context: Context, targetMac: String? = null): Result {
         val fix = resolveCurrentLocation(context)
             ?: return Result.Failure("no GPS fix — set a mock location or wait for a real fix")
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, name, mac) = transportSetup
-        return try {
-            transport.open()
+        return withDevice(context, targetMac) { transport, paired ->
             val r = LocationInjector.setCoordinate(transport, fix.latitude, fix.longitude)
             if (r.success) {
                 Result.Success(
-                    deviceName = name,
-                    deviceMac = mac,
+                    deviceName = paired.name,
+                    deviceMac = paired.mac,
                     seedLat = fix.latitude,
                     seedLon = fix.longitude,
                     status = r.status,
@@ -273,27 +274,18 @@ object UploadPipeline {
             } else {
                 Result.Failure(r.message, r.status)
             }
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
         }
     }
 
     /**
-     * Returns the injected [Point] on success, or null when no fix
-     * was available or the device rejected. Never throws — failure
+     * Push an already-resolved [fix] to the device, returning it on
+     * success and null when the device rejected. Never throws — failure
      * is silent so the route upload path stays robust.
      */
-    private suspend fun injectCurrentLocationBestEffort(
-        context: Context,
+    private suspend fun pushLocationBestEffort(
         transport: Transport,
+        fix: Point,
     ): Point? {
-        val fix = resolveCurrentLocation(context)
-        if (fix == null) {
-            Log.i(TAG, "location-seed: no fix available — skipping")
-            return null
-        }
         val r = try {
             LocationInjector.setCoordinate(transport, fix.latitude, fix.longitude)
         } catch (e: Exception) {
@@ -315,42 +307,59 @@ object UploadPipeline {
      * Fetch AssistNow Online data and upload it to the device as
      * `file_type=AGPS`. Standalone entry point used by the
      * `…action.SEND_AGPS` adb broadcast for headless verification;
-     * the route-upload path calls [uploadAgpsBestEffort] internally
-     * instead so a failure here doesn't break the route flow.
+     * the route-upload path fetches and pushes the same bytes inline
+     * (see [fetchAgpsOrNull] / [pushAgpsBestEffort]) so a failure there
+     * doesn't break the route flow.
      */
     @SuppressLint("MissingPermission")
     suspend fun seedAgps(context: Context, targetMac: String? = null): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, name, mac) = transportSetup
-        return try {
-            transport.open()
-            val sent = uploadAgpsBestEffort(context, transport, suppressErrors = false)
-                ?: return Result.Failure("AGPS upload failed — see logcat for details")
-            Result.Success(
-                deviceName = name,
-                deviceMac = mac,
-                agpsBytes = sent,
-            )
+        // Network round-trip before the device lease — see uploadGpx.
+        val data = try {
+            fetchAgps(context)
         } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
+            return Result.Failure("AGPS fetch failed: ${e.message}")
+        }
+        if (data.isEmpty()) {
+            return Result.Failure("AGPS fetch returned 0 bytes — invalid token?")
+        }
+        return withDevice(context, targetMac) { transport, paired ->
+            val r = pushAgps(transport, data)
+            if (r.success) {
+                Log.i(TAG, "agps: seeded ${data.size}B, device status=${r.status}")
+                Result.Success(
+                    deviceName = paired.name,
+                    deviceMac = paired.mac,
+                    agpsBytes = data.size,
+                )
+            } else {
+                Result.Failure("AGPS rejected: ${r.message}", r.status)
+            }
         }
     }
 
     /**
-     * Returns the number of AGPS bytes successfully pushed to the
-     * device, or null when the step was skipped (no token configured)
-     * or failed (network / device rejection). Never throws when
-     * [suppressErrors] is true — callers can ignore the null and
-     * proceed with whatever they were going to do next.
+     * AssistNow Online bytes, or null when the step should be skipped —
+     * no usable token, network error, or an empty reply. Never throws;
+     * the route upload treats AGPS as strictly best-effort.
+     *
+     * Kept separate from [pushAgpsBestEffort] so the HTTP round-trip
+     * happens *before* the device lease is taken.
      */
-    private suspend fun uploadAgpsBestEffort(
-        context: Context,
-        transport: Transport,
-        suppressErrors: Boolean = true,
-    ): Int? {
+    private suspend fun fetchAgpsOrNull(context: Context): ByteArray? {
+        val data = try {
+            fetchAgps(context)
+        } catch (e: Exception) {
+            Log.w(TAG, "agps: fetch failed: ${e.message}")
+            return null
+        }
+        if (data.isEmpty()) {
+            Log.w(TAG, "agps: u-blox returned 0 bytes — invalid token?")
+            return null
+        }
+        return data
+    }
+
+    private suspend fun fetchAgps(context: Context): ByteArray {
         // Token resolution order:
         //   1. Runtime override from Settings → AgpsTokenStore.
         //   2. BuildConfig.AGPS_TOKEN — build-time injection.
@@ -361,42 +370,42 @@ object UploadPipeline {
             de.syntaxfehler.ligpsport.data.AgpsTokenStore(context).get()
                 ?: BuildConfig.AGPS_TOKEN.takeIf { it.isNotBlank() }
         val client = AgpsClient()
-        val data = try {
+        return try {
             val t0 = System.currentTimeMillis()
             val bytes = client.fetchOnline(overrideToken)
             Log.i(TAG, "agps: fetched ${bytes.size}B in ${System.currentTimeMillis() - t0}ms")
             bytes
-        } catch (e: Exception) {
-            Log.w(TAG, "agps: fetch failed: ${e.message}")
-            client.runCatching { close() }
-            if (!suppressErrors) throw e
-            return null
         } finally {
             client.runCatching { close() }
         }
-        if (data.isEmpty()) {
-            Log.w(TAG, "agps: u-blox returned 0 bytes — invalid token?")
-            return null
-        }
+    }
 
+    private suspend fun pushAgps(transport: Transport, data: ByteArray): FileTransfer.UploadResult {
         // file_id mirrors the official app: GPS_TYPE enum number. We
         // request GPS+GLO+GAL+BDS so any of the four is reasonable;
         // pick 1 (GPS) to stay deterministic. file_name = "online_<utc-date>".
         val dateUtc = SimpleDateFormat("yyyyMMdd", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }.format(Date())
+        return FileTransfer.uploadGeneralFile(
+            transport = transport,
+            fileBytes = data,
+            fileId = 1L,
+            fileName = "online_$dateUtc",
+            fileExtension = "ubx",
+            fileType = FileTransfer.FILE_OP_TYPE_AGPS,
+        )
+    }
+
+    /**
+     * Number of AGPS bytes the device accepted, or null when it rejected
+     * them. Never throws — the route upload proceeds either way.
+     */
+    private suspend fun pushAgpsBestEffort(transport: Transport, data: ByteArray): Int? {
         val r = try {
-            FileTransfer.uploadGeneralFile(
-                transport = transport,
-                fileBytes = data,
-                fileId = 1L,
-                fileName = "online_$dateUtc",
-                fileExtension = "ubx",
-                fileType = FileTransfer.FILE_OP_TYPE_AGPS,
-            )
+            pushAgps(transport, data)
         } catch (e: Exception) {
             Log.w(TAG, "agps: ble upload exception: ${e.message}")
-            if (!suppressErrors) throw e
             return null
         }
         return if (r.success) {
@@ -404,7 +413,6 @@ object UploadPipeline {
             data.size
         } else {
             Log.w(TAG, "agps: device rejected (status=${r.status}): ${r.message}")
-            if (!suppressErrors) error("device rejected: status=${r.status}")
             null
         }
     }
@@ -418,11 +426,7 @@ object UploadPipeline {
         fileExtension: String = "cnx",
         targetMac: String? = null,
     ): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, _, _) = transportSetup
-        return try {
-            transport.open()
+        return withDevice(context, targetMac) { transport, _ ->
             val r = FileTransfer.deleteRoute(
                 transport = transport,
                 fileId = fileId,
@@ -433,67 +437,36 @@ object UploadPipeline {
             } else {
                 Result.Failure(r.message, r.status)
             }
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
         }
     }
 
     // ---- Delete all (destructive) -----------------------------------
 
     @SuppressLint("MissingPermission")
-    suspend fun deleteAllRoutes(context: Context, targetMac: String? = null): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, _, _) = transportSetup
-        return try {
-            transport.open()
+    suspend fun deleteAllRoutes(context: Context, targetMac: String? = null): Result =
+        withDevice(context, targetMac) { transport, _ ->
             val r = FileTransfer.deleteAllRoutes(transport)
             if (r.success) Result.Success(status = r.status)
             else Result.Failure(r.message, r.status)
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
         }
-    }
 
     // ---- List ---------------------------------------------------------
 
     @SuppressLint("MissingPermission")
-    suspend fun listRoutes(context: Context, targetMac: String? = null): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, name, mac) = transportSetup
-        return try {
-            transport.open()
+    suspend fun listRoutes(context: Context, targetMac: String? = null): Result =
+        withDevice(context, targetMac) { transport, paired ->
             val entries = FileTransfer.listRoutes(transport)
-            Result.Success(deviceName = name, deviceMac = mac, routes = entries)
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
+            Result.Success(deviceName = paired.name, deviceMac = paired.mac, routes = entries)
         }
-    }
 
     // ---- Nav-status (PROTOCOL.md §7.3) --------------------------------
 
     @SuppressLint("MissingPermission")
-    suspend fun navStatus(context: Context, targetMac: String? = null): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, name, mac) = transportSetup
-        return try {
-            transport.open()
+    suspend fun navStatus(context: Context, targetMac: String? = null): Result =
+        withDevice(context, targetMac) { transport, paired ->
             val ns = FileTransfer.navStatus(transport)
-            Result.Success(deviceName = name, deviceMac = mac, navStatus = ns)
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
+            Result.Success(deviceName = paired.name, deviceMac = paired.mac, navStatus = ns)
         }
-    }
 
     // ---- Delete by id (FILES_DEL) ------------------------------------
 
@@ -505,41 +478,24 @@ object UploadPipeline {
         fileExtension: String = "cnx",
         targetMac: String? = null,
     ): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, _, _) = transportSetup
-        return try {
-            transport.open()
+        return withDevice(context, targetMac) { transport, _ ->
             val r = FileTransfer.deleteRoutesById(
                 transport = transport,
                 targets = listOf(FileTransfer.DeleteTarget(fileId, name, fileExtension)),
             )
             if (r.success) Result.Success(status = r.status, fileId = fileId)
             else Result.Failure(r.message, r.status)
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
         }
     }
 
     // ---- Activities (CYCLING_DATA — recorded FIT files) --------------
 
     @SuppressLint("MissingPermission")
-    suspend fun listActivities(context: Context, targetMac: String? = null): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, name, mac) = transportSetup
-        return try {
-            transport.open()
+    suspend fun listActivities(context: Context, targetMac: String? = null): Result =
+        withDevice(context, targetMac) { transport, paired ->
             val entries = FileTransfer.listActivities(transport)
-            Result.Success(deviceName = name, deviceMac = mac, activities = entries)
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
+            Result.Success(deviceName = paired.name, deviceMac = paired.mac, activities = entries)
         }
-    }
 
     /**
      * Download one recorded activity by `timestamp`. Writes the FIT
@@ -556,62 +512,35 @@ object UploadPipeline {
      * it.
      */
     @SuppressLint("MissingPermission")
-    suspend fun downloadActivity(context: Context, timestamp: Long, targetMac: String? = null): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, name, mac) = transportSetup
-        return try {
-            transport.open()
+    suspend fun downloadActivity(context: Context, timestamp: Long, targetMac: String? = null): Result =
+        withDevice(context, targetMac) { transport, paired ->
             val download = FileTransfer.downloadActivity(transport, timestamp)
             val saved = saveActivityFit(context, timestamp, download.content)
             Result.Success(
-                deviceName = name,
-                deviceMac = mac,
+                deviceName = paired.name,
+                deviceMac = paired.mac,
                 activityBytes = download.content.size,
                 activityFileName = download.fileName.takeIf { it.isNotEmpty() },
                 activitySavedPath = saved.absolutePath,
                 activityTimestamp = timestamp,
             )
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
         }
-    }
 
     @SuppressLint("MissingPermission")
-    suspend fun deleteActivity(context: Context, timestamp: Long, targetMac: String? = null): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, _, _) = transportSetup
-        return try {
-            transport.open()
+    suspend fun deleteActivity(context: Context, timestamp: Long, targetMac: String? = null): Result =
+        withDevice(context, targetMac) { transport, _ ->
             val status = FileTransfer.deleteActivity(transport, timestamp)
             if (status == 0) Result.Success(status = status, activityTimestamp = timestamp)
             else Result.Failure(FileTransfer.deviceStatusName(status), status)
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
         }
-    }
 
     @SuppressLint("MissingPermission")
-    suspend fun deleteAllActivities(context: Context, targetMac: String? = null): Result {
-        val transportSetup = openPairedTransport(context, targetMac)
-            ?: return Result.Failure("no paired device")
-        val (transport, _, _) = transportSetup
-        return try {
-            transport.open()
+    suspend fun deleteAllActivities(context: Context, targetMac: String? = null): Result =
+        withDevice(context, targetMac) { transport, _ ->
             val status = FileTransfer.deleteAllActivities(transport)
             if (status == 0) Result.Success(status = status)
             else Result.Failure(FileTransfer.deviceStatusName(status), status)
-        } catch (e: Exception) {
-            Result.Failure("BLE error: ${e.message}")
-        } finally {
-            transport.runCatching { close() }
         }
-    }
 
     private fun saveActivityFit(context: Context, timestamp: Long, content: ByteArray): java.io.File {
         // Scoped external storage — no runtime permissions needed.
@@ -676,35 +605,52 @@ object UploadPipeline {
     }
 
     /**
-     * Resolve a fresh [BleTransport] for a specific device. When
-     * [targetMac] is null we pick the first paired device — that
-     * preserves the existing single-device semantics for every legacy
-     * caller (UploadScreen, the adb harness, etc.). When non-null we
-     * look the MAC up in [DeviceStore]; an unrecognised MAC returns
-     * null so the caller surfaces "device not paired" instead of
-     * silently routing to the wrong target.
+     * Resolve which paired device an operation targets. When [targetMac]
+     * is null we pick the first paired device — that preserves the
+     * existing single-device semantics for every legacy caller
+     * (UploadScreen, the adb harness, etc.). When non-null we look the
+     * MAC up in [DeviceStore]; an unrecognised MAC returns null so the
+     * caller surfaces "device not paired" instead of silently routing to
+     * the wrong target.
      */
-    @SuppressLint("MissingPermission")
-    private fun openPairedTransport(
-        context: Context,
-        targetMac: String? = null,
-    ): Triple<BleTransport, String?, String>? {
-        val store = DeviceStore(context)
-        val all = store.list()
+    private fun resolvePaired(context: Context, targetMac: String?): DeviceStore.Paired? {
+        val all = DeviceStore(context).list()
         if (all.isEmpty()) return null
-        val paired = if (targetMac == null) {
+        return if (targetMac == null) {
             all.first()
         } else {
-            all.firstOrNull { it.mac.equals(targetMac, ignoreCase = true) } ?: return null
+            all.firstOrNull { it.mac.equals(targetMac, ignoreCase = true) }
         }
-        val adapter = bluetoothAdapter(context) ?: return null
-        if (!adapter.isEnabled) return null
-        val device = try {
-            adapter.getRemoteDevice(paired.mac)
-        } catch (_: IllegalArgumentException) {
-            return null
-        }
-        return Triple(BleTransport(context, device), paired.name, paired.mac)
+    }
+
+    /**
+     * Run [block] against an exclusive lease on the target device's
+     * shared connection ([BleSessionManager]).
+     *
+     * `CancellationException` deliberately escapes: a composable leaving
+     * the screen mid-poll is not a BLE failure, and reporting it as one
+     * used to make the nav-status pill flip to "Connecting…" for no
+     * reason.
+     */
+    private suspend fun withDevice(
+        context: Context,
+        targetMac: String?,
+        block: suspend (Transport, DeviceStore.Paired) -> Result,
+    ): Result {
+        val paired = resolvePaired(context, targetMac) ?: return Result.Failure("no paired device")
+        return withDevice(context, paired, block)
+    }
+
+    private suspend fun withDevice(
+        context: Context,
+        paired: DeviceStore.Paired,
+        block: suspend (Transport, DeviceStore.Paired) -> Result,
+    ): Result = try {
+        BleSessionManager.withSession(context, paired.mac) { transport -> block(transport, paired) }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Result.Failure("BLE error: ${e.message}")
     }
 
     private fun bluetoothAdapter(context: Context): BluetoothAdapter? {
@@ -715,16 +661,25 @@ object UploadPipeline {
     // ---- Fan-out helpers --------------------------------------------
     //
     // Multi-device entry points. They iterate over every paired device
-    // in parallel (a separate BLE connection per device — the BSC200's
-    // GATT stack is fine handling 3 sockets concurrently) and return a
-    // MAC-keyed map of per-device results. Callers that want the
-    // legacy "do one device" behaviour still use the original singular
-    // functions above with their default targetMac=null.
+    // in parallel and return a MAC-keyed map of per-device results.
+    // [BleSessionManager] leases are per MAC, so the fan-out stays truly
+    // concurrent — one connection per device, never two per device.
+    // Callers that want the legacy "do one device" behaviour still use
+    // the original singular functions above with targetMac=null.
 
     /**
      * Upload [gpxBytes] to every paired device in parallel.
+     *
      * MAC-keyed result map; the keys are uppercase canonical MACs as
      * stored in [DeviceStore]. Empty map → no devices paired.
+     *
+     * One pipeline attempt per device by default. Connect-level retries
+     * live in [BleSessionManager] (which also rebuilds a link the stack
+     * dropped while the app was idle), so retrying the whole upload here
+     * would only re-send megabytes for a device that is genuinely
+     * switched off — the exact regression that made an upload wait ~3×
+     * the GATT connect timeout before the UI could surface "Uploaded ✓".
+     * Callers can still opt in with [maxAttempts] > 1.
      */
     @SuppressLint("MissingPermission")
     suspend fun uploadGpxAll(
@@ -732,19 +687,31 @@ object UploadPipeline {
         gpxBytes: ByteArray,
         fileId: Long = System.currentTimeMillis() / 1000L,
         fileName: String = "route",
+        maxAttempts: Int = 1,
     ): Map<String, Result> {
         val macs = DeviceStore(context).list().map { it.mac }
         if (macs.isEmpty()) return emptyMap()
+        val attempts = maxAttempts.coerceAtLeast(1)
         return coroutineScope {
             macs.map { mac ->
                 mac to async {
-                    uploadGpx(
-                        context = context,
-                        gpxBytes = gpxBytes,
-                        fileId = fileId,
-                        fileName = fileName,
-                        targetMac = mac,
-                    )
+                    var last: Result = Result.Failure("not attempted")
+                    repeat(attempts) { i ->
+                        last = uploadGpx(
+                            context = context,
+                            gpxBytes = gpxBytes,
+                            fileId = fileId,
+                            fileName = fileName,
+                            targetMac = mac,
+                        )
+                        if (last is Result.Success) return@async last
+                        Log.w(
+                            TAG,
+                            "uploadGpxAll: $mac attempt ${i + 1}/$attempts failed: " +
+                                (last as Result.Failure).reason,
+                        )
+                    }
+                    last
                 }
             }.associate { (mac, deferred) -> mac to deferred.await() }
         }

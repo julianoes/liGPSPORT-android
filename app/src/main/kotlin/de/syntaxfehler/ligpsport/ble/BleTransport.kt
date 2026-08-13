@@ -38,11 +38,18 @@ import kotlin.coroutines.resumeWithException
 class BleTransport(
     private val context: Context,
     private val device: BluetoothDevice,
-) : Transport {
+) : ManagedTransport {
 
     private val mutex = Mutex()
     private var gatt: BluetoothGatt? = null
     private var negotiatedMtu: Int = DEFAULT_MTU
+
+    // Written from the GATT callback thread, read by [isConnected] from
+    // arbitrary coroutine threads — [BleSessionManager] uses it to tell a
+    // still-usable cached link from one the stack dropped while the app
+    // was idle.
+    @Volatile
+    private var connected: Boolean = false
 
     // RX (we write here, device-side receive) and TX (notify, we
     // listen here) characteristics for each of the 4 channels.
@@ -63,20 +70,37 @@ class BleTransport(
     private var pendingDiscover: CancellableContinuation<Unit>? = null
     private var pendingWrite: CancellableContinuation<Unit>? = null
     private var pendingDescriptor: CancellableContinuation<Unit>? = null
+    private var pendingDisconnect: CancellableContinuation<Unit>? = null
 
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    pendingConnect?.resume(Unit)
+                    // A non-success status alongside STATE_CONNECTED means
+                    // the link came up broken (some stacks report 133 this
+                    // way instead of via STATE_DISCONNECTED). Treat it as a
+                    // connect failure so the caller retries on a fresh
+                    // BluetoothGatt rather than driving a dead socket.
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        connected = true
+                        pendingConnect?.resume(Unit)
+                    } else {
+                        Log.w(TAG, "connected with error status=$status")
+                        pendingConnect?.resumeWithException(
+                            IllegalStateException("BLE connect failed (status=$status)"),
+                        )
+                    }
                     pendingConnect = null
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.i(TAG, "disconnected; status=$status")
+                    connected = false
                     pendingConnect?.resumeWithException(
                         IllegalStateException("BLE disconnected (status=$status)"),
                     )
                     pendingConnect = null
+                    pendingDisconnect?.resume(Unit)
+                    pendingDisconnect = null
                     received.close()
                 }
             }
@@ -231,12 +255,37 @@ class BleTransport(
 
     override suspend fun close() {
         mutex.withLock {
-            try { gatt?.disconnect() } catch (_: Exception) {}
-            try { gatt?.close() } catch (_: Exception) {}
+            val g = gatt
+            if (g != null && connected) {
+                // Await the disconnect callback before releasing the
+                // client interface. `close()` immediately after
+                // `disconnect()` aborts the teardown mid-flight and the
+                // ACL link lingers, which makes the *next* connect to the
+                // same MAC come back as status=133.
+                try {
+                    g.disconnect()
+                    withTimeoutOrNull(DISCONNECT_TIMEOUT_MS) {
+                        suspendCancellableCoroutine<Unit> { c -> pendingDisconnect = c }
+                    } ?: Log.w(TAG, "disconnect callback timed out")
+                } catch (_: Exception) {
+                } finally {
+                    pendingDisconnect = null
+                }
+            }
+            try { g?.close() } catch (_: Exception) {}
             gatt = null
+            connected = false
             received.close()
         }
     }
+
+    /**
+     * True while the GATT link is up. [BleSessionManager] polls this to
+     * decide whether a cached transport can be reused or has to be
+     * rebuilt — a transport is single-use, since [received] is closed for
+     * good once the device drops.
+     */
+    override fun isConnected(): Boolean = connected && gatt != null
 
     fun mtu(): Int = negotiatedMtu
 
@@ -308,6 +357,7 @@ class BleTransport(
         private const val MTU_TIMEOUT_MS = 5_000L
         private const val DISCOVER_TIMEOUT_MS = 10_000L
         private const val WRITE_TIMEOUT_MS = 10_000L
+        private const val DISCONNECT_TIMEOUT_MS = 2_000L
         // 0x2902 — standard Client Characteristic Configuration descriptor
         private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }

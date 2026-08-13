@@ -49,6 +49,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import de.syntaxfehler.ligpsport.ble.BleSessionManager
 import de.syntaxfehler.ligpsport.ble.DeviceScanner
 import de.syntaxfehler.ligpsport.ble.DeviceStore
 import kotlinx.coroutines.flow.collectLatest
@@ -113,10 +114,13 @@ fun PairingScreen(onPaired: () -> Unit, onBack: () -> Unit) {
             scope.launch {
                 try {
                     @Suppress("MissingPermission")
-                    scanner.scan().collectLatest { dev ->
-                        @Suppress("MissingPermission")
-                        val name = try { dev.name } catch (_: SecurityException) { null }
-                        scanned[dev.address] = ScanEntry(dev, name)
+                    scanner.scan().collectLatest { hit ->
+                        // Fall back to the label we last knew this MAC by.
+                        // Unpairing drops the slot but keeps the label, so
+                        // a device the user just removed still shows up by
+                        // name instead of as a bare MAC address.
+                        val label = store.labelFor(hit.address, hit.name)
+                        scanned[hit.address] = ScanEntry(hit.device, label)
                     }
                 } catch (e: Exception) {
                     statusMessage = "Scan failed: ${e.message}"
@@ -168,6 +172,7 @@ fun PairingScreen(onPaired: () -> Unit, onBack: () -> Unit) {
                         onRemove = {
                             store.remove(p.mac)
                             paired.removeAll { it.mac.equals(p.mac, ignoreCase = true) }
+                            scope.launch { BleSessionManager.forget(p.mac) }
                         },
                     )
                 }
@@ -211,7 +216,12 @@ fun PairingScreen(onPaired: () -> Unit, onBack: () -> Unit) {
             }
             items(
                 items = scanned.values.sortedBy { it.name ?: it.device.address }.toList(),
-                key = { it.device.address },
+                // Prefix the key — paired devices above use the bare MAC,
+                // and a scanned MAC may match one already paired (we still
+                // render it here, dimmed, as a "paired" hint). Sharing
+                // keys across two `items(...)` calls in the same
+                // LazyColumn throws IllegalArgumentException.
+                key = { "scan_${it.device.address}" },
             ) { entry ->
                 val alreadyPaired = paired.any { it.mac.equals(entry.device.address, ignoreCase = true) }
                 ScannedRow(

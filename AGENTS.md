@@ -367,6 +367,17 @@ them — they're already encoded in code.
    public method, and `suspendCancellableCoroutine` to bridge the
    callback API to coroutines. Don't change this without good reason.
 
+   That mutex only covers **one transport instance**, which is not
+   enough. `BleSessionManager` owns exactly one `BleTransport` per MAC
+   and hands out exclusive leases on it, so a route upload and the
+   nav-status poll can never hold two connections to the same computer
+   (they used to, and the poll's disconnect killed the upload — issue
+   #3). Leases are per MAC, so `uploadGpxAll` still fans out in
+   parallel. **Never construct a `BleTransport` directly outside
+   `BleSessionManager`** — go through `UploadPipeline`'s `withDevice`.
+   Off-device work (AGPS HTTP fetch, GPS fix) belongs *before* the
+   lease, not inside it.
+
 7. **MTU**: BSC200 negotiates 247 (BLE 4.2). We request that on
    connect and chunk at `mtu - 3` (ATT header overhead). Default falls
    back to 23 if negotiation fails.

@@ -31,11 +31,20 @@ class DeviceStore(context: Context) {
     /** One stored pairing. [mac] is canonical (`XX:XX:XX:XX:XX:XX`). */
     data class Paired(val mac: String, val name: String?)
 
-    /** Snapshot of every pairing, slot-ordered. Empty when nothing is paired. */
+    /**
+     * Snapshot of every pairing, slot-ordered. Empty when nothing is
+     * paired. The [Paired.name] field is the user-set nickname when
+     * one exists for the MAC (set via [setNickname]) — otherwise the
+     * BLE-advertised name captured at [add] time. Nicknames survive
+     * [remove] so a user can drop a device and re-pair without
+     * relabelling it every time.
+     */
     fun list(): List<Paired> = buildList {
         for (i in 0 until MAX_DEVICES) {
             val mac = prefs.getString(keyAddress(i), null) ?: break
-            add(Paired(mac = mac, name = prefs.getString(keyName(i), null)))
+            val advertised = prefs.getString(keyName(i), null)
+            val nickname = prefs.getString(keyNickname(mac), null)
+            add(Paired(mac = mac, name = nickname ?: advertised))
         }
     }
 
@@ -56,16 +65,72 @@ class DeviceStore(context: Context) {
             current += Paired(canonical, name)
         }
         writeAll(current)
+        rememberName(canonical, name)
         return true
     }
 
-    /** Remove the given MAC. No-op if it wasn't paired. */
+    /**
+     * Remember the label a MAC was last known by, independent of whether
+     * it is currently paired. `BluetoothDevice.name` is frequently null
+     * during a scan (the OS name cache is only populated after a
+     * connection or a scan record that carries the complete local name),
+     * so after a user unpairs a device the pairing screen would show it
+     * again as a bare MAC. Persisting the label lets the scan list stay
+     * readable. Nicknames win over advertised names; see [labelFor].
+     */
+    fun rememberName(mac: String, name: String?) {
+        if (name.isNullOrBlank()) return
+        prefs.edit().putString(keyLastName(mac), name.trim()).apply()
+    }
+
+    /**
+     * Best-known human label for [mac]: user nickname, else the last
+     * advertised name we saw, else null. [advertised] is the name from
+     * the current scan, used when we have nothing stored (and recorded
+     * for next time).
+     */
+    fun labelFor(mac: String, advertised: String? = null): String? {
+        val canonical = mac.uppercase()
+        if (!advertised.isNullOrBlank()) rememberName(canonical, advertised)
+        return prefs.getString(keyNickname(canonical), null)
+            ?: advertised?.takeIf { it.isNotBlank() }
+            ?: prefs.getString(keyLastName(canonical), null)
+    }
+
+    /**
+     * Remove the given MAC. No-op if it wasn't paired. The user-set
+     * nickname (if any) is preserved — re-pairing the same MAC later
+     * brings the custom label back without the user having to retype
+     * it.
+     */
     fun remove(mac: String) {
         val canonical = mac.uppercase()
         writeAll(list().filterNot { it.mac.equals(canonical, ignoreCase = true) })
     }
 
-    /** Forget every paired device. */
+    /**
+     * Get / set / clear the user-defined nickname for [mac]. Stored
+     * separately from the slot list so it persists across [remove] +
+     * re-[add] cycles. A blank or null name clears the nickname (the
+     * UI then falls back to the BLE-advertised name).
+     */
+    fun nickname(mac: String): String? = prefs.getString(keyNickname(mac), null)
+
+    fun setNickname(mac: String, name: String?) {
+        val canonical = mac.uppercase()
+        val editor = prefs.edit()
+        if (name.isNullOrBlank()) {
+            editor.remove(keyNickname(canonical))
+        } else {
+            editor.putString(keyNickname(canonical), name.trim())
+        }
+        editor.apply()
+    }
+
+    /**
+     * Forget every paired device. Nicknames are wiped too — this is
+     * the "factory reset" path, not the per-device "remove" gesture.
+     */
     fun clear() {
         prefs.edit().clear().apply()
     }
@@ -88,17 +153,27 @@ class DeviceStore(context: Context) {
      * device, which goes through [add]).
      */
     fun save(name: String?, address: String) {
-        prefs.edit().clear().apply()
+        // Drop the slots via writeAll rather than `prefs.clear()` so the
+        // per-MAC labels (nickname / last-known name) survive — a re-pair
+        // shouldn't cost the user their custom naming.
+        writeAll(emptyList())
         add(name = name, mac = address)
     }
 
     private fun writeAll(devices: List<Paired>) {
+        // Preserve the per-MAC label keys across slot rewrites — they
+        // live outside the slot keys but a naive `editor.clear()` would
+        // wipe them alongside. Snapshot, clear, restore.
+        val labelSnapshot = prefs.all.entries
+            .filter { it.key.startsWith(NICKNAME_PREFIX) || it.key.startsWith(LAST_NAME_PREFIX) }
+            .associate { it.key to (it.value as? String) }
         val editor = prefs.edit()
         editor.clear()
         devices.take(MAX_DEVICES).forEachIndexed { i, d ->
             editor.putString(keyAddress(i), d.mac.uppercase())
             editor.putString(keyName(i), d.name)
         }
+        labelSnapshot.forEach { (k, v) -> if (v != null) editor.putString(k, v) }
         editor.apply()
     }
 
@@ -121,11 +196,15 @@ class DeviceStore(context: Context) {
 
     private fun keyAddress(index: Int) = "address_$index"
     private fun keyName(index: Int) = "name_$index"
+    private fun keyNickname(mac: String) = "$NICKNAME_PREFIX${mac.uppercase()}"
+    private fun keyLastName(mac: String) = "$LAST_NAME_PREFIX${mac.uppercase()}"
 
     companion object {
-        const val MAX_DEVICES = 3
+        const val MAX_DEVICES = 10
         private const val PREFS = "ligpsport.paired_device"
         private const val LEGACY_KEY_ADDRESS = "address"
         private const val LEGACY_KEY_NAME = "name"
+        private const val NICKNAME_PREFIX = "nick_"
+        private const val LAST_NAME_PREFIX = "lastname_"
     }
 }
