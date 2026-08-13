@@ -6,18 +6,36 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-08-14
+
+Multi-device pairing and the Google-Maps-style multi-stop editor, plus
+the BLE session rework that made uploading to an already-paired device
+reliable again.
+
 ### Added
 
-- **Pair up to 3 BSC200 cycling computers simultaneously.** Uploading
-  a route fans out to every paired device in parallel — each one
-  opens its own GATT socket, the results come back as a per-device
-  map, and the destination card surfaces "all OK" vs "2/3 OK — last5
-  failed: …" rather than committing to a single outcome.
+- **Pair several BSC200 cycling computers simultaneously**
+  (`DeviceStore.MAX_DEVICES = 10`). Uploading a route fans out to
+  every paired device in parallel — one shared GATT session per
+  device, results come back as a per-device map, and the destination
+  card surfaces "all OK" vs "2/3 OK — last failed: …" rather than
+  committing to a single outcome.
 - **Bottom-left status stack** with one pill per paired device.
   Each pill polls its device's nav status independently every 15 s
   and shows `<device> · Navigating: <route>` / `Idle` / `Connecting…`
   — implicitly doubling as a "which devices are reachable" signal.
-- **Per-device sub-menus in Settings.** "Paired devices (n / 3)" is
+- **Previous rides.** Every upload is snapshotted with the full set
+  of editor inputs — start, vias, destination and their labels —
+  alongside the resolved GPX, so re-opening a ride shows what the
+  device actually received. Reachable from Settings; tapping an entry
+  restores the whole route onto the map, and the auto-planner leaves
+  the saved polyline alone until you edit a stop. Capped with FIFO
+  eviction so the history blob can't stall a cold start.
+- **Swap start and destination** from the top bar. Vias reverse with
+  them so the new geometry doesn't double back.
+- **Rename a paired device** from Settings. Nicknames survive
+  unpairing and re-pairing.
+- **Per-device sub-menus in Settings.** "Paired devices (n / 10)" is
   the top section now; each device row has its own "Routes on
   device" and "Activities on device" launchers plus a forget button.
   The sub-screen Top App Bar reads the device name as a subtitle so
@@ -25,8 +43,35 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - **Pairing flow supports adding instead of replacing.** The
   pairing screen lists currently-paired devices at the top with X
   buttons; scan results below append rather than overwrite, capped
-  at the new `DeviceStore.MAX_DEVICES = 3`. Existing single-device
-  installs migrate the legacy SharedPreferences keys into slot 0.
+  at `DeviceStore.MAX_DEVICES`. Existing single-device installs
+  migrate the legacy SharedPreferences keys into slot 0.
+
+### Fixed
+
+- **Route uploads no longer fail while devices stay paired** (#3).
+  Every pipeline helper used to open its own GATT connection, so the
+  15-second-per-device nav-status poll and a route upload could hold
+  two links to the same computer at once. An upload runs well past
+  15 s, so the collision hit almost every attempt: the poll's
+  disconnect closed the upload's frame channel and the ack wait came
+  back empty. The only way out was to unpair every device — which
+  worked only because that silences the pollers. A new
+  `BleSessionManager` keeps one shared connection per MAC and leases
+  it exclusively, with connect retries and transparent reconnection
+  of a link the stack dropped while the app was idle. Different MACs
+  still upload in parallel.
+- `BleTransport.close()` waits for the disconnect callback before
+  releasing the GATT client, so an immediate reconnect to the same
+  MAC no longer races the teardown into `status=133`.
+- Cancelling a nav-status poll (leaving the map) is no longer
+  reported as a BLE failure.
+- The AGPS download and the GPS fix are resolved before the device
+  link is taken instead of during it.
+- **Scan results keep the device name after unpairing.** The last
+  known label per MAC is persisted separately from the pairing slot,
+  and the scanner now reads the advertisement's local name rather
+  than relying on the OS name cache, so a just-removed device shows
+  up by name instead of as a bare MAC address.
 
 ### Changed
 
@@ -46,10 +91,27 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   Long-press remains a quick shortcut for "add a stop" (matches
   existing muscle memory) and now reverse-geocodes the added
   waypoint so its top-bar row shows the nearest place name.
-- **Intermediate stops are now reorderable** via drag handles on
-  each via row in the top bar. Each row also has an X button for
-  removal — tapping the marker on the map no longer removes the
-  stop, since stray taps used to drop stops by accident.
+- **Intermediate stops are now reorderable** by long-pressing any
+  via row and dragging it through the list — the separate drag handle
+  is gone. Each row also has an X button for removal; tapping the
+  marker on the map no longer removes the stop, since stray taps used
+  to drop stops by accident.
+- **Vias reverse-geocode like start and destination** instead of
+  reading "Stop N". Lookups are tracked per via, so dragging one
+  doesn't fire a duplicate request for another still in flight.
+- **The via glyph matches the other leading icons** in the stops
+  column. The previous filled circle made vias read as a different
+  kind of element from start / add / destination when all four are
+  peers.
+- **Map tiles survive between launches.** The osmdroid cache moved
+  from `cacheDir` — which Android evicts under storage pressure, so
+  the map appeared to re-download on every launch — to `filesDir`
+  with a 300 MiB ceiling, and a 30-day TTL override replaces the
+  ~1-day `max-age` Mapnik returns. The in-RAM bitmap cache goes from
+  the ~9-tile default to 250, removing re-decode jank when panning
+  within a recently-loaded area.
+- Route distance is parsed once per planned GPX rather than on every
+  recomposition.
 
 ## [1.2.0] — 2026-05-17
 
